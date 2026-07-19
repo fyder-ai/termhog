@@ -14,9 +14,9 @@ pub struct PtyProcess {
     /// alive. Kept alive until teardown so the read loop can reach EOF.
     pub master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     pub child: Box<dyn Child + Send + Sync>,
-    /// Blocking reader over the master; owned by the read thread.
+    /// Blocking reader over the master. Owned by the read thread.
     pub reader: Box<dyn io::Read + Send>,
-    /// Writer to the master; owned by the stdin-forward thread (take_writer can
+    /// Writer to the master. Owned by the stdin-forward thread (take_writer can
     /// only be called once).
     pub writer: Box<dyn io::Write + Send>,
     /// Child's process-group leader pid, for forwarding terminating signals.
@@ -24,14 +24,8 @@ pub struct PtyProcess {
 }
 
 /// Open a pty of the given size, spawn `argv` in it inheriting cwd + environment
-/// (with `TERM` ensured), and return the decomposed handles. `extra_env` is set
-/// on the child on top of the inherited environment.
-pub fn spawn(
-    argv: &[String],
-    cols: u16,
-    rows: u16,
-    extra_env: &[(&str, String)],
-) -> Result<PtyProcess> {
+/// (with `TERM` ensured), and return the decomposed handles.
+pub fn spawn(argv: &[String], cols: u16, rows: u16) -> Result<PtyProcess> {
     if argv.is_empty() {
         bail!("no command to run");
     }
@@ -49,17 +43,12 @@ pub fn spawn(
     let mut cmd = CommandBuilder::new(&argv[0]);
     cmd.args(&argv[1..]);
     // Inherit cwd for transparent passthrough. The full environment is inherited
-    // by default; ensure TERM is present so the child emits the right sequences.
+    // by default. Ensure TERM is present so the child emits the right sequences.
     if let Ok(cwd) = std::env::current_dir() {
         cmd.cwd(cwd);
     }
     if std::env::var_os("TERM").is_none() {
         cmd.env("TERM", "xterm-256color");
-    }
-    // So the wrapped command's own PostHog SDK can tag its events/exceptions to
-    // this replay's session and person.
-    for (key, val) in extra_env {
-        cmd.env(key, val);
     }
 
     let child = pair
@@ -69,7 +58,10 @@ pub fn spawn(
     // Critical: drop the slave so the master sees EOF once the child exits.
     drop(pair.slave);
 
-    let reader = pair.master.try_clone_reader().context("cloning pty reader")?;
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .context("cloning pty reader")?;
     let writer = pair.master.take_writer().context("taking pty writer")?;
     let pgid = pair.master.process_group_leader();
 

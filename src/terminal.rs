@@ -1,6 +1,6 @@
 //! Host terminal control: raw mode, bulletproof restoration, panic hook.
 //!
-//! The child's PTY slave owns line discipline and signal generation; the host
+//! The child's PTY slave owns line discipline and signal generation. The host
 //! terminal is put into raw mode so keystrokes (including `^C` = 0x03) flow
 //! through untouched to the child. Restoration must survive normal return, `?`
 //! propagation, panic, and signals — hence a `Drop` guard plus a panic hook
@@ -178,7 +178,7 @@ pub fn query_terminal(cols: u16, rows: u16) -> TerminalInfo {
         return TerminalInfo::default();
     }
 
-    // Emit all queries up front; the DA1 sentinel must come last.
+    // Emit all queries up front. The DA1 sentinel must come last.
     let mut q = String::from("\x1b]10;?\x1b\\\x1b]11;?\x1b\\");
     for n in 0..16 {
         q.push_str(&format!("\x1b]4;{n};?\x1b\\"));
@@ -297,7 +297,7 @@ fn csi_t_replies(buf: &[u8]) -> Vec<Vec<u32>> {
 }
 
 /// Parse accumulated OSC replies into a full theme. Requires fg, bg, and all 16
-/// palette entries; returns `None` otherwise so the caller uses a default.
+/// palette entries. Returns `None` otherwise so the caller uses a default.
 fn parse_theme(buf: &[u8]) -> Option<ThemeColors> {
     let mut fg = None;
     let mut bg = None;
@@ -438,7 +438,7 @@ mod tests {
 
     #[test]
     fn cell_size_from_16t() {
-        // CSI 6 ; height ; width t — cell is 9 wide, 18 tall.
+        // `CSI 6;height;width t` — cell is 9 wide, 18 tall.
         let c = parse_cell_size(b"\x1b[6;18;9t", 80, 24).unwrap();
         assert_eq!((c.width, c.height), (9, 18));
     }

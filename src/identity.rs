@@ -1,4 +1,4 @@
-//! Persistent anonymous person id, mirroring posthog-js's device id: a UUIDv7
+//! Persistent anonymous person ID, mirroring posthog-js's device ID: a UUIDv7
 //! generated once and reused, so the same user maps to one PostHog person across
 //! runs. An explicit id (config/env) acts like `identify()`.
 
@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use uuid::Uuid;
 
-/// Resolve the distinct_id: an explicit override wins; otherwise reuse the id
+/// Resolve the distinct_id: an explicit override wins, otherwise reuse the ID
 /// persisted in the config dir, generating and storing one on first use.
 pub fn resolve(override_id: Option<String>) -> String {
     if let Some(id) = override_id.filter(|s| !s.is_empty()) {

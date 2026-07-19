@@ -2,7 +2,7 @@
 //!
 //! The player reconstructs a DOM, so we render the terminal as a fixed
 //! `rows`×`cols` grid: a `<pre>` containing one `<div>` per row, each holding
-//! style-run `<span>`s. A FullSnapshot builds the whole tree; incremental
+//! style-run `<span>`s. A FullSnapshot builds the whole tree. Incremental
 //! Mutations replace the children of the rows that changed since the last emit.
 //! The cursor is drawn by overlaying reverse-video on its cell, so cursor moves
 //! surface as ordinary row changes.
@@ -70,8 +70,7 @@ impl Theme {
     fn resolve(source: Option<ThemeColors>) -> Self {
         match source {
             Some(t) if t.palette.len() == 16 => {
-                let palette: [String; 16] =
-                    std::array::from_fn(|i| t.palette[i].clone());
+                let palette: [String; 16] = std::array::from_fn(|i| t.palette[i].clone());
                 Theme {
                     fg: t.fg,
                     bg: t.bg,
@@ -380,8 +379,12 @@ impl Projector {
         if *style == Style::default() {
             return String::new();
         }
-        let mut fg = self.resolve(style.fg).unwrap_or_else(|| self.theme.fg.clone());
-        let mut bg = self.resolve(style.bg).unwrap_or_else(|| self.theme.bg.clone());
+        let mut fg = self
+            .resolve(style.fg)
+            .unwrap_or_else(|| self.theme.fg.clone());
+        let mut bg = self
+            .resolve(style.bg)
+            .unwrap_or_else(|| self.theme.bg.clone());
         let has_bg = style.bg.is_some() || style.inverse;
         if style.inverse {
             std::mem::swap(&mut fg, &mut bg);
@@ -422,13 +425,7 @@ impl Projector {
             0..=15 => self.theme.palette[i as usize].clone(),
             16..=231 => {
                 let i = i - 16;
-                let comp = |v: u8| -> u8 {
-                    if v == 0 {
-                        0
-                    } else {
-                        v * 40 + 55
-                    }
-                };
+                let comp = |v: u8| -> u8 { if v == 0 { 0 } else { v * 40 + 55 } };
                 let r = comp(i / 36);
                 let g = comp((i / 6) % 6);
                 let b = comp(i % 6);
@@ -447,7 +444,9 @@ const NBSP: &str = "\u{a0}";
 /// A row `<div>`'s children with allocated ids, rendered either nested (for a
 /// FullSnapshot) or flat (for a mutation's adds).
 enum RowChild {
-    Nbsp { id: i64 },
+    Nbsp {
+        id: i64,
+    },
     Span {
         span_id: i64,
         css: String,
@@ -577,7 +576,10 @@ mod tests {
         // whose parent is the span added just before it.
         for a in adds {
             let kids = a["node"]["childNodes"].as_array();
-            assert!(kids.map(|k| k.is_empty()).unwrap_or(true), "add is not flat: {a}");
+            assert!(
+                kids.map(|k| k.is_empty()).unwrap_or(true),
+                "add is not flat: {a}"
+            );
         }
         // A span add is followed by its text-node add carrying "hi!".
         let text_add = adds
@@ -608,7 +610,10 @@ mod tests {
                 .map(|css| css.contains("background-color"))
                 .unwrap_or(false)
         });
-        assert!(has_bg, "expected a reverse-video cursor span with a background");
+        assert!(
+            has_bg,
+            "expected a reverse-video cursor span with a background"
+        );
     }
 
     #[test]

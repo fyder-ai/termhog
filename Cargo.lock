@@ -849,7 +849,6 @@ dependencies = [
  "flate2",
  "libc",
  "log",
- "nix",
  "portable-pty",
  "reqwest",
  "rustix",

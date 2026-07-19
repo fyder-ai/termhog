@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use crate::util::epoch_ms;
 
-/// Identifies this client to PostHog (`$lib`); metadata only, lets you filter
+/// Identifies this client to PostHog (`$lib`). Metadata only, lets you filter
 /// replays by `$lib = ph-capture`.
 const LIB_NAME: &str = "ph-capture";
 /// Flush at least this often during a live session.
@@ -30,7 +30,7 @@ const FLUSH_INTERVAL: Duration = Duration::from_millis(1500);
 /// `RECORDING_MAX_EVENT_SIZE`.
 const MAX_BATCH_BYTES: usize = 800 * 1024;
 /// If the network is down, keep buffering up to this before dropping the oldest
-/// events (bounded memory; the replay self-heals via the next keyframe).
+/// events (bounded memory, the replay self-heals via the next keyframe).
 const HARD_BUFFER_CAP: usize = 8 * 1024 * 1024;
 
 pub struct Config {
@@ -55,7 +55,7 @@ impl Config {
 pub enum Msg {
     /// One rrweb event to stream.
     Event(Value),
-    /// End of session; flush and send `term_end`.
+    /// End of session. Flush and send `term_end`.
     Terminate { exit_code: i32, duration_ms: u64 },
 }
 
@@ -73,7 +73,12 @@ pub fn run(config: Config, rx: Receiver<Msg>) {
     };
 
     // Analytics event so the recording shows in the replay list + links a person.
-    send_analytics(&client, &config, "term_start", json!({ "command": config.command }));
+    send_analytics(
+        &client,
+        &config,
+        "term_start",
+        json!({ "command": config.command }),
+    );
 
     let mut buf: Vec<Value> = Vec::new();
     let mut buf_bytes = 0usize;
@@ -117,7 +122,12 @@ pub fn run(config: Config, rx: Receiver<Msg>) {
 /// POST the buffered events as one `$snapshot` batch. On failure the buffer is
 /// kept for retry (bounded by `HARD_BUFFER_CAP`), never silently dropped — rrweb
 /// timestamps are set at capture time, so a late upload lands correctly.
-fn flush(client: &reqwest::blocking::Client, config: &Config, buf: &mut Vec<Value>, buf_bytes: &mut usize) {
+fn flush(
+    client: &reqwest::blocking::Client,
+    config: &Config,
+    buf: &mut Vec<Value>,
+    buf_bytes: &mut usize,
+) {
     if buf.is_empty() {
         return;
     }
@@ -126,21 +136,30 @@ fn flush(client: &reqwest::blocking::Client, config: &Config, buf: &mut Vec<Valu
         config.ingest_host, LIB_NAME, config.lib_version
     );
     let body = snapshot_body(config, buf);
-    match post(client, &url, &body) {
+    match post(client, &url, body) {
         Ok(()) => {
             buf.clear();
             *buf_bytes = 0;
         }
         Err(e) => {
             config.report(crate::Diagnostic::Upload(e));
-            let mut dropped = 0u32;
-            while *buf_bytes > HARD_BUFFER_CAP && !buf.is_empty() {
-                let ev = buf.remove(0);
-                *buf_bytes = buf_bytes.saturating_sub(ev.to_string().len());
+            // Drop oldest events until under the cap. Count how many first, then
+            // drain them in a single pass.
+            let mut dropped = 0;
+            let mut freed = 0;
+            for ev in buf.iter() {
+                if buf_bytes.saturating_sub(freed) <= HARD_BUFFER_CAP {
+                    break;
+                }
+                freed += ev.to_string().len();
                 dropped += 1;
             }
             if dropped > 0 {
-                config.report(crate::Diagnostic::Dropped { count: dropped });
+                buf.drain(..dropped);
+                *buf_bytes = buf_bytes.saturating_sub(freed);
+                config.report(crate::Diagnostic::Dropped {
+                    count: dropped as u32,
+                });
             }
         }
     }
@@ -172,12 +191,17 @@ fn snapshot_body(config: &Config, events: &[Value]) -> Vec<u8> {
             "distinct_id": config.distinct_id,
         }
     }]);
-    gzip(&serde_json::to_vec(&payload).unwrap_or_default())
+    gzip_json(&payload)
 }
 
-/// Send one analytics event to `/i/v0/e/`, tagged with the session id so it
+/// Send one analytics event to `/i/v0/e/`, tagged with the session ID so it
 /// links the recording to a person and the replay list.
-fn send_analytics(client: &reqwest::blocking::Client, config: &Config, event: &str, mut properties: Value) {
+fn send_analytics(
+    client: &reqwest::blocking::Client,
+    config: &Config,
+    event: &str,
+    mut properties: Value,
+) {
     if let Some(obj) = properties.as_object_mut() {
         obj.insert("$session_id".into(), json!(config.session_id));
         obj.insert("$lib".into(), json!(LIB_NAME));
@@ -194,8 +218,8 @@ fn send_analytics(client: &reqwest::blocking::Client, config: &Config, event: &s
         "{}/i/v0/e/?compression=gzip-js&ip=1&ver={}/{}",
         config.ingest_host, LIB_NAME, config.lib_version
     );
-    let body = gzip(&serde_json::to_vec(&payload).unwrap_or_default());
-    if let Err(e) = post(client, &url, &body) {
+    let body = gzip_json(&payload);
+    if let Err(e) = post(client, &url, body) {
         config.report(crate::Diagnostic::Analytics {
             event: event.to_string(),
             reason: e,
@@ -203,11 +227,11 @@ fn send_analytics(client: &reqwest::blocking::Client, config: &Config, event: &s
     }
 }
 
-fn post(client: &reqwest::blocking::Client, url: &str, body: &[u8]) -> Result<(), String> {
+fn post(client: &reqwest::blocking::Client, url: &str, body: Vec<u8>) -> Result<(), String> {
     let resp = client
         .post(url)
         .header("Content-Type", "text/plain")
-        .body(body.to_vec())
+        .body(body)
         .send()
         .map_err(|e| e.to_string())?;
     if resp.status().is_success() {
@@ -217,6 +241,11 @@ fn post(client: &reqwest::blocking::Client, url: &str, body: &[u8]) -> Result<()
     }
 }
 
+/// Serialize a JSON payload and gzip it — the body shape both endpoints expect.
+fn gzip_json(payload: &Value) -> Vec<u8> {
+    gzip(&serde_json::to_vec(payload).unwrap_or_default())
+}
+
 fn gzip(data: &[u8]) -> Vec<u8> {
     let mut enc = GzEncoder::new(Vec::new(), Compression::default());
     let _ = enc.write_all(data);
@@ -224,7 +253,7 @@ fn gzip(data: &[u8]) -> Vec<u8> {
 }
 
 /// Construct the replay deep link, exactly as posthog-js does: the write-only
-/// token sits in the URL path where the numeric project id would. `seek_secs`
+/// token sits in the URL path where the numeric project ID would. `seek_secs`
 /// adds a `?t=` to land near a point of interest (e.g. just before a failure).
 pub fn replay_url(ui_host: &str, token: &str, session_id: &str, seek_secs: Option<u64>) -> String {
     let mut url = format!("{ui_host}/project/{token}/replay/{session_id}");
@@ -234,26 +263,9 @@ pub fn replay_url(ui_host: &str, token: &str, session_id: &str, seek_secs: Optio
     url
 }
 
-/// Derive the UI/app host from the ingestion host. PostHog Cloud ingests on
-/// `*.i.posthog.com` but serves the app on `*.posthog.com`; self-hosted uses one
-/// host for both.
-pub fn derive_ui_host(ingest_host: &str) -> String {
-    ingest_host
-        .replace("://us.i.posthog.com", "://us.posthog.com")
-        .replace("://eu.i.posthog.com", "://eu.posthog.com")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn ui_host_maps_cloud_ingest_to_app() {
-        assert_eq!(derive_ui_host("https://us.i.posthog.com"), "https://us.posthog.com");
-        assert_eq!(derive_ui_host("https://eu.i.posthog.com"), "https://eu.posthog.com");
-        // self-hosted unchanged
-        assert_eq!(derive_ui_host("https://ph.example.com"), "https://ph.example.com");
-    }
 
     #[test]
     fn replay_url_shape() {

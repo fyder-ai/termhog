@@ -89,7 +89,7 @@ impl Emulator for AvtEmulator {
 
     fn row_runs(&self, row: u16) -> Vec<Run> {
         let line = self.vt.line(row as usize);
-        // `chunks` splits wherever the predicate returns true; Pen is Eq, so we
+        // `chunks` splits wherever the predicate returns true. Pen is Eq, so we
         // split at every style change to get maximal same-style runs.
         let mut runs: Vec<Run> = line
             .chunks(|a, b| a.pen() != b.pen())

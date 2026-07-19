@@ -1,15 +1,11 @@
 [package]
 name = "ph-capture"
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.82"
+edition = "2024"
+rust-version = "1.85"
 license = "MIT"
 description = "Record terminal sessions as PostHog session replays"
 repository = "https://github.com/watts-ai/ph-capture"
-
-[lib]
-name = "ph_capture"
-path = "src/lib.rs"
 
 [[bin]]
 name = "ph-capture"
@@ -31,4 +27,3 @@ uuid = { version = "1.20.0", features = ["v4", "v7"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "rustls"] }
 clap = { version = "4.5.61", features = ["derive"] }
 thiserror = "2"
-nix = { version = "0.28", features = ["term"] }
