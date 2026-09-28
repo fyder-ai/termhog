@@ -3,10 +3,9 @@
 Record terminal sessions and stream them to [PostHog](https://posthog.com) as
 session replays.
 
-TermHog runs a command, passes its output through untouched, and in the
-background projects the terminal screen into rrweb events that PostHog's replay
-player understands. Use it from Rust as a library, or wrap any command with the
-CLI.
+TermHog runs CLI commands, outputs verbatim to the host terminal, and in the
+background projects the terminal screen into rrweb events that PostHog's
+session replay player understands.
 
 ## Library
 
