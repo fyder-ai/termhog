@@ -1,8 +1,9 @@
 //! Small shared helpers.
 
 use std::cell::{Cell, RefCell};
+use std::fs::File;
 use std::io::{self, Write};
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::process::ExitStatusExt;
 use std::panic::{AssertUnwindSafe, PanicHookInfo};
 use std::process::ExitStatus;
@@ -12,7 +13,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use nix::errno::Errno;
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::signal::{SigHandler, Signal, raise};
+use rustix::fs::fstat;
 use rustix::io::retry_on_intr;
+#[cfg(not(target_os = "linux"))]
+use rustix::io::{FdFlags, fcntl_getfd, fcntl_setfd};
 use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
 use serde::Serialize;
 
@@ -106,6 +110,31 @@ pub fn wait_exited(pid: u32, nohang: bool) -> io::Result<bool> {
     }
     let status = retry_on_intr(|| waitid(WaitId::Pid(pid), options))?;
     Ok(status.is_some())
+}
+
+/// A pipe, as its read end and write end, both close-on-exec so no other
+/// child inherits them.
+pub fn pipe() -> io::Result<(File, OwnedFd)> {
+    #[cfg(target_os = "linux")]
+    let (read, write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?;
+    #[cfg(not(target_os = "linux"))]
+    let (read, write) = {
+        // No atomic close-on-exec flag here, so set it right away.
+        let (read, write) = rustix::pipe::pipe()?;
+        for fd in [&read, &write] {
+            fcntl_setfd(fd, fcntl_getfd(fd)? | FdFlags::CLOEXEC)?;
+        }
+        (read, write)
+    };
+    Ok((File::from(read), write))
+}
+
+/// Whether two fds refer to the same file (or pipe).
+pub fn same_file(a: impl AsFd, b: impl AsFd) -> bool {
+    match (fstat(a), fstat(b)) {
+        (Ok(a), Ok(b)) => (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino),
+        _ => false,
+    }
 }
 
 /// Write all bytes to a raw fd, looping over partial writes. Bypasses

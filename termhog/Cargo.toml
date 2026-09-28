@@ -19,7 +19,7 @@ dirs = "7"
 flate2 = "1"
 log = "0.4.22"
 nix = { version = "0.31", features = ["poll", "process", "resource", "signal"] }
-rustix = { version = "1", features = ["fs", "process", "pty", "termios"] }
+rustix = { version = "1", features = ["fs", "pipe", "process", "pty", "termios"] }
 serde = { version = "1.0.189", features = ["derive"] }
 serde_json = "1.0.25"
 signal-hook = "0.3"

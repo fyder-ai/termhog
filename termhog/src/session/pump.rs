@@ -180,6 +180,17 @@ impl Source {
     }
 }
 
+/// Start a thread teeing child output from `pipe` to `out` (see
+/// [`read_loop`]).
+pub fn tee(
+    pipe: impl Read + AsFd + Send + 'static,
+    out: impl AsFd + Send + 'static,
+    feed: &Feed,
+) -> JoinHandle<()> {
+    let feed = feed.clone();
+    thread::spawn(move || read_loop(pipe, out, Source::Pipe, feed))
+}
+
 /// Copy child output (pty master or pipe) byte-exact to the real stream it
 /// stands in for, then hand it to the recording. stdout and stderr share one
 /// recorded stream in arrival order, as a terminal interleaves them.

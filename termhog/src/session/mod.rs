@@ -115,9 +115,17 @@ pub fn spawn(settings: TermHog, command: &mut HogCommand) -> Result<Recording> {
     let err_pty = slave.is_some() && err_tty && on_stdout_terminal(io::stderr().as_fd());
     let tee_stdout = slave.is_none() && command.stdout.is_inherit();
     let tee_stderr = command.stderr.is_inherit() && !(slave.is_some() && err_tty);
+    // Output that all goes to one place (like `2>&1`) arrives there in the
+    // order it's written, so it gets one pipe, read in order, not one each.
+    let merged = if tee_stdout && tee_stderr && util::same_file(io::stdout(), io::stderr()) {
+        Some(util::pipe()?)
+    } else {
+        None
+    };
     let stdio = |on_pty: bool, tee: bool, spec: &HogStdio| -> io::Result<_> {
-        Ok(match slave {
-            Some(slave) if on_pty => slave.try_clone()?.into(),
+        Ok(match (slave, &merged) {
+            (Some(slave), _) if on_pty => slave.try_clone()?.into(),
+            (_, Some((_, write))) if tee => write.try_clone()?.into(),
             _ if tee => std::process::Stdio::piped(),
             _ => spec.to_std()?,
         })
@@ -139,10 +147,11 @@ pub fn spawn(settings: TermHog, command: &mut HogCommand) -> Result<Recording> {
         source,
     })?;
     let start = Instant::now();
-    // Drop every slave handle we hold so the master sees EOF once the child
-    // exits.
+    // Drop every slave and pipe write end we hold, so readers see EOF once
+    // the child exits.
     drop(std_cmd);
     let master = pty.map(|pty| pty.master);
+    let merged = merged.map(|(read, _write)| read);
     // A child with its own controlling terminal leads its own process group,
     // so signals go to the whole group.
     signals.set_child(child.id(), attachment.is_some());
@@ -173,17 +182,17 @@ pub fn spawn(settings: TermHog, command: &mut HogCommand) -> Result<Recording> {
     });
     let (mut stdout, mut stderr) = (child.stdout.take(), child.stderr.take());
     let mut pipe_readers = Vec::new();
-    if tee_stdout {
-        let (pipe, feed) = (stdout.take().expect("piped stdout"), feed.clone());
-        pipe_readers.push(thread::spawn(move || {
-            pump::read_loop(pipe, io::stdout(), Source::Pipe, feed)
-        }));
-    }
-    if tee_stderr {
-        let (pipe, feed) = (stderr.take().expect("piped stderr"), feed.clone());
-        pipe_readers.push(thread::spawn(move || {
-            pump::read_loop(pipe, io::stderr(), Source::Pipe, feed)
-        }));
+    if let Some(pipe) = merged {
+        pipe_readers.push(pump::tee(pipe, io::stdout(), &feed));
+    } else {
+        if tee_stdout {
+            let pipe = stdout.take().expect("piped stdout");
+            pipe_readers.push(pump::tee(pipe, io::stdout(), &feed));
+        }
+        if tee_stderr {
+            let pipe = stderr.take().expect("piped stderr");
+            pipe_readers.push(pump::tee(pipe, io::stderr(), &feed));
+        }
     }
     let attached = attachment.map(|a| a.start(&feed));
 
