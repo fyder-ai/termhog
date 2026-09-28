@@ -13,6 +13,7 @@ categories = ["command-line-utilities", "development-tools"]
 [[bin]]
 name = "termhog"
 path = "src/main.rs"
+doc = false
 
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
