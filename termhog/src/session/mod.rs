@@ -16,8 +16,9 @@ use uuid::Uuid;
 
 use crate::render::Remainder;
 use crate::tty::{self, pty, signals};
+use crate::upload::spool::Spool;
 use crate::util::{self, epoch_ms};
-use crate::{Command, Error, Outcome, Result, TermHog, handoff, render, upload};
+use crate::{Error, HogCommand, HogStdio, Outcome, Result, TermHog, handoff, render, upload};
 use pump::{Attached, Attachment, Source};
 
 /// A running, recorded child. Mirrors [`std::process::Child`].
@@ -27,11 +28,11 @@ use pump::{Attached, Attachment, Source};
 /// finishes, in the background, once the child exits (if the app is still
 /// running then).
 pub struct Recording {
-    /// The child's stdin, if the command set it to [`crate::Stdio::piped`].
+    /// The child's stdin, if the command set it to [`HogStdio::piped`].
     pub stdin: Option<ChildStdin>,
-    /// The child's stdout, if the command set it to [`crate::Stdio::piped`].
+    /// The child's stdout, if the command set it to [`HogStdio::piped`].
     pub stdout: Option<ChildStdout>,
-    /// The child's stderr, if the command set it to [`crate::Stdio::piped`].
+    /// The child's stderr, if the command set it to [`HogStdio::piped`].
     pub stderr: Option<ChildStderr>,
     pid: u32,
     replay_url: String,
@@ -65,15 +66,18 @@ struct Active {
 }
 
 /// Spawn and record `command`. See [`TermHog::spawn`].
-pub fn spawn(settings: TermHog, command: &mut Command) -> Result<Recording> {
+pub fn spawn(settings: TermHog, command: &mut HogCommand) -> Result<Recording> {
     let out_tty = command.stdout.is_inherit() && termios::isatty(io::stdout());
     let err_tty = command.stderr.is_inherit() && termios::isatty(io::stderr());
     let in_tty = command.stdin.is_inherit() && termios::isatty(io::stdin());
 
+    // Where the recording's data waits to be rendered and uploaded.
+    let backlog = render::Backlog::new().map_err(Error::TempFile)?;
+    let spool = Spool::new().map_err(Error::TempFile)?;
+
     // Keeps SIGTERM/SIGHUP from killing us with the terminal left raw. It's
     // in place before raw mode, and gets the child once there is one.
     let signals = signals::watch();
-    tty::install_panic_hook();
 
     // Only take over the terminal when stdout is on it. When just stderr is
     // (e.g. `termhog -- make | less`), the terminal belongs to the next
@@ -111,7 +115,7 @@ pub fn spawn(settings: TermHog, command: &mut Command) -> Result<Recording> {
     let err_pty = slave.is_some() && err_tty && on_stdout_terminal(io::stderr().as_fd());
     let tee_stdout = slave.is_none() && command.stdout.is_inherit();
     let tee_stderr = command.stderr.is_inherit() && !(slave.is_some() && err_tty);
-    let stdio = |on_pty: bool, tee: bool, spec: &crate::Stdio| -> io::Result<_> {
+    let stdio = |on_pty: bool, tee: bool, spec: &HogStdio| -> io::Result<_> {
         Ok(match slave {
             Some(slave) if on_pty => slave.try_clone()?.into(),
             _ if tee => std::process::Stdio::piped(),
@@ -150,7 +154,7 @@ pub fn spawn(settings: TermHog, command: &mut Command) -> Result<Recording> {
     let replay_url =
         upload::replay_url(&settings.resolved_ui_host(), &settings.api_key, &session_id);
     let config = upload_config(&settings, command, session_id);
-    let (upload_tx, upload_handle) = upload::start(config.clone());
+    let (upload_tx, upload_handle) = upload::start(config.clone(), spool);
     let sink = {
         let upload_tx = upload_tx.clone();
         Box::new(move |event| {
@@ -158,7 +162,8 @@ pub fn spawn(settings: TermHog, command: &mut Command) -> Result<Recording> {
         })
     };
     let probed = attachment.as_ref().is_some_and(|a| a.probed);
-    let (feed, render_handle) = render::start((cols, rows), probed, sink, config.on_panic());
+    let on_panic = config.on_panic();
+    let (feed, render_handle) = render::start((cols, rows), probed, backlog, sink, on_panic);
 
     // Output readers. The pty merges every stream attached to it, mirrored to
     // stdout (a pty only exists when stdout is the terminal).
@@ -209,7 +214,7 @@ pub fn spawn(settings: TermHog, command: &mut Command) -> Result<Recording> {
 }
 
 /// Who the recording belongs to, from `settings`.
-fn upload_config(settings: &TermHog, command: &Command, session_id: String) -> upload::Config {
+fn upload_config(settings: &TermHog, command: &HogCommand, session_id: String) -> upload::Config {
     upload::Config {
         ingest_host: settings.ingest_host.clone(),
         api_key: settings.api_key.clone(),

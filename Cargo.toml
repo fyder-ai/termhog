@@ -3,6 +3,7 @@ members = ["termhog", "termhog-cli"]
 resolver = "3"
 
 [workspace.package]
+description = "Record terminal sessions as PostHog session replays"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"

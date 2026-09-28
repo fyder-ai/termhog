@@ -14,7 +14,7 @@ use std::process::{ChildStderr, ChildStdin, ChildStdout};
 
 /// Where a child's stdin, stdout, or stderr goes. Mirrors [`std::process::Stdio`].
 #[derive(Debug)]
-pub struct Stdio(pub(crate) StdioKind);
+pub struct HogStdio(pub(crate) StdioKind);
 
 #[derive(Debug)]
 pub(crate) enum StdioKind {
@@ -25,20 +25,20 @@ pub(crate) enum StdioKind {
     Fd(OwnedFd),
 }
 
-impl Stdio {
+impl HogStdio {
     /// The child uses the parent's stream. Only inherited stdout/stderr are recorded.
-    pub fn inherit() -> Stdio {
-        Stdio(StdioKind::Inherit)
+    pub fn inherit() -> HogStdio {
+        HogStdio(StdioKind::Inherit)
     }
 
     /// The child's stream is connected to the null device.
-    pub fn null() -> Stdio {
-        Stdio(StdioKind::Null)
+    pub fn null() -> HogStdio {
+        HogStdio(StdioKind::Null)
     }
 
     /// A pipe is opened to the child, exposed on [`crate::Recording`].
-    pub fn piped() -> Stdio {
-        Stdio(StdioKind::Piped)
+    pub fn piped() -> HogStdio {
+        HogStdio(StdioKind::Piped)
     }
 
     pub(crate) fn is_inherit(&self) -> bool {
@@ -60,9 +60,9 @@ impl Stdio {
 /// Connect a stream to an open file, pipe end, or the like, as std does.
 macro_rules! stdio_from {
     ($($ty:ty),*) => {$(
-        impl From<$ty> for Stdio {
-            fn from(value: $ty) -> Stdio {
-                Stdio(StdioKind::Fd(value.into()))
+        impl From<$ty> for HogStdio {
+            fn from(value: $ty) -> HogStdio {
+                HogStdio(StdioKind::Fd(value.into()))
             }
         }
     )*};
@@ -73,42 +73,42 @@ stdio_from!(File, OwnedFd, ChildStdin, ChildStdout, ChildStderr);
 /// A process builder with the same API and defaults as [`std::process::Command`].
 /// Every stream defaults to inherit.
 #[derive(Debug)]
-pub struct Command {
+pub struct HogCommand {
     pub(crate) program: OsString,
     args: Vec<OsString>,
     /// Ordered env edits. `None` removes the variable.
     envs: Vec<(OsString, Option<OsString>)>,
     env_clear: bool,
     current_dir: Option<PathBuf>,
-    pub(crate) stdin: Stdio,
-    pub(crate) stdout: Stdio,
-    pub(crate) stderr: Stdio,
+    pub(crate) stdin: HogStdio,
+    pub(crate) stdout: HogStdio,
+    pub(crate) stderr: HogStdio,
 }
 
-impl Command {
+impl HogCommand {
     /// A command for running `program`, with no arguments, the parent's
     /// environment and working directory, and every stream inherited.
-    pub fn new<S: AsRef<OsStr>>(program: S) -> Command {
-        Command {
+    pub fn new<S: AsRef<OsStr>>(program: S) -> HogCommand {
+        HogCommand {
             program: program.as_ref().to_owned(),
             args: Vec::new(),
             envs: Vec::new(),
             env_clear: false,
             current_dir: None,
-            stdin: Stdio::inherit(),
-            stdout: Stdio::inherit(),
-            stderr: Stdio::inherit(),
+            stdin: HogStdio::inherit(),
+            stdout: HogStdio::inherit(),
+            stderr: HogStdio::inherit(),
         }
     }
 
     /// Add an argument.
-    pub fn arg<S: AsRef<OsStr>>(&mut self, arg: S) -> &mut Command {
+    pub fn arg<S: AsRef<OsStr>>(&mut self, arg: S) -> &mut HogCommand {
         self.args.push(arg.as_ref().to_owned());
         self
     }
 
     /// Add arguments.
-    pub fn args<I, S>(&mut self, args: I) -> &mut Command
+    pub fn args<I, S>(&mut self, args: I) -> &mut HogCommand
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
@@ -120,7 +120,7 @@ impl Command {
     }
 
     /// Set an environment variable for the child.
-    pub fn env<K, V>(&mut self, key: K, val: V) -> &mut Command
+    pub fn env<K, V>(&mut self, key: K, val: V) -> &mut HogCommand
     where
         K: AsRef<OsStr>,
         V: AsRef<OsStr>,
@@ -131,7 +131,7 @@ impl Command {
     }
 
     /// Set environment variables for the child.
-    pub fn envs<I, K, V>(&mut self, vars: I) -> &mut Command
+    pub fn envs<I, K, V>(&mut self, vars: I) -> &mut HogCommand
     where
         I: IntoIterator<Item = (K, V)>,
         K: AsRef<OsStr>,
@@ -144,39 +144,39 @@ impl Command {
     }
 
     /// Remove an environment variable from the child's environment.
-    pub fn env_remove<K: AsRef<OsStr>>(&mut self, key: K) -> &mut Command {
+    pub fn env_remove<K: AsRef<OsStr>>(&mut self, key: K) -> &mut HogCommand {
         self.envs.push((key.as_ref().to_owned(), None));
         self
     }
 
     /// Start the child with an empty environment, plus any variables set
     /// after this.
-    pub fn env_clear(&mut self) -> &mut Command {
+    pub fn env_clear(&mut self) -> &mut HogCommand {
         self.env_clear = true;
         self.envs.clear();
         self
     }
 
     /// Set the child's working directory.
-    pub fn current_dir<P: AsRef<Path>>(&mut self, dir: P) -> &mut Command {
+    pub fn current_dir<P: AsRef<Path>>(&mut self, dir: P) -> &mut HogCommand {
         self.current_dir = Some(dir.as_ref().to_owned());
         self
     }
 
     /// Where the child's stdin comes from. Defaults to inherit.
-    pub fn stdin<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Command {
+    pub fn stdin<T: Into<HogStdio>>(&mut self, cfg: T) -> &mut HogCommand {
         self.stdin = cfg.into();
         self
     }
 
     /// Where the child's stdout goes. Defaults to inherit, which is recorded.
-    pub fn stdout<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Command {
+    pub fn stdout<T: Into<HogStdio>>(&mut self, cfg: T) -> &mut HogCommand {
         self.stdout = cfg.into();
         self
     }
 
     /// Where the child's stderr goes. Defaults to inherit, which is recorded.
-    pub fn stderr<T: Into<Stdio>>(&mut self, cfg: T) -> &mut Command {
+    pub fn stderr<T: Into<HogStdio>>(&mut self, cfg: T) -> &mut HogCommand {
         self.stderr = cfg.into();
         self
     }
@@ -192,7 +192,7 @@ impl Command {
     }
 
     /// The environment changes, in the order they apply. `None` removes the
-    /// variable. Like std, this doesn't include [`Command::env_clear`].
+    /// variable. Like std, this doesn't include [`HogCommand::env_clear`].
     pub fn get_envs(&self) -> impl ExactSizeIterator<Item = (&OsStr, Option<&OsStr>)> {
         self.envs
             .iter()

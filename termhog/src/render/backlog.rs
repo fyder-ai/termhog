@@ -24,21 +24,17 @@ pub enum Chunk {
 
 /// Shared by the readers (which add output) and the render thread (which
 /// takes it).
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Backlog(Arc<Shared>);
 
-#[derive(Default)]
 struct Shared {
     /// Bytes held in memory, not yet rendered.
     in_memory: AtomicUsize,
     spill: Mutex<Spill>,
 }
 
-#[derive(Default)]
 struct Spill {
-    /// Created on first use. `None` also if it couldn't be, in which case
-    /// output stays in memory.
-    file: Option<File>,
+    file: File,
     /// Where the next chunk is appended.
     end: u64,
     /// Bytes written but not yet rendered.
@@ -46,8 +42,22 @@ struct Spill {
 }
 
 impl Backlog {
+    /// An empty backlog, with a new unnamed temporary file to spill to.
+    pub fn new() -> io::Result<Backlog> {
+        let spill = Spill {
+            file: tempfile::tempfile()?,
+            end: 0,
+            pending: 0,
+        };
+        Ok(Backlog(Arc::new(Shared {
+            in_memory: AtomicUsize::new(0),
+            spill: Mutex::new(spill),
+        })))
+    }
+
     /// Hold `bytes` for the render thread: in memory while it keeps up, on
-    /// disk once it's far behind.
+    /// disk once it's far behind. If writing to disk fails (a full disk,
+    /// say), they're kept in memory rather than lost.
     pub fn hold(&self, bytes: Vec<u8>) -> Chunk {
         let behind = self.0.in_memory.load(Ordering::Relaxed) + bytes.len() > MEMORY_LIMIT;
         if behind {
@@ -73,17 +83,12 @@ impl Backlog {
                     .lock()
                     .map_err(|_| io::Error::other("poisoned"))?;
                 let mut bytes = vec![0; len];
-                let result = match &spill.file {
-                    Some(file) => file.read_exact_at(&mut bytes, offset),
-                    None => Err(io::Error::other("no backlog file")),
-                };
+                let result = spill.file.read_exact_at(&mut bytes, offset);
                 spill.pending -= len as u64;
                 if spill.pending == 0 {
                     // Everything written has been rendered: start over.
                     spill.end = 0;
-                    if let Some(file) = &spill.file {
-                        let _ = file.set_len(0);
-                    }
+                    let _ = spill.file.set_len(0);
                 }
                 result.map(|()| bytes)
             }
@@ -93,11 +98,8 @@ impl Backlog {
     /// Append `bytes` to the backlog file. `None` if it can't be written.
     fn spill(&self, bytes: &[u8]) -> Option<Chunk> {
         let mut spill = self.0.spill.lock().ok()?;
-        if spill.file.is_none() {
-            spill.file = tempfile::tempfile().ok();
-        }
         let offset = spill.end;
-        spill.file.as_ref()?.write_all_at(bytes, offset).ok()?;
+        spill.file.write_all_at(bytes, offset).ok()?;
         spill.end += bytes.len() as u64;
         spill.pending += bytes.len() as u64;
         Some(Chunk::Spilled {
@@ -113,7 +115,7 @@ mod tests {
 
     #[test]
     fn spills_once_far_behind_and_keeps_order() {
-        let backlog = Backlog::default();
+        let backlog = Backlog::new().unwrap();
         let big = vec![b'a'; MEMORY_LIMIT];
         let first = backlog.hold(big.clone());
         assert!(matches!(first, Chunk::Memory(_)));

@@ -1,47 +1,8 @@
-//! TermHog records a child process's terminal output and streams it to
-//! PostHog as a session replay.
-//!
-//! [`TermHog`] holds the PostHog settings and runs a [`Command`], which mirrors
-//! [`std::process::Command`]. The child behaves as if std had spawned it:
-//! streams left inherited are recorded on their way to the terminal, and
-//! everything the caller redirects is left alone. A child writing to a
-//! terminal runs on its own pseudoterminal that mirrors the real one, the way
-//! `script`, `tmux` and `ssh` run programs.
-//!
-//! ```no_run
-//! use termhog::{Command, TermHog};
-//!
-//! let outcome = TermHog::new("phc_...")
-//!     .status(Command::new("nvim").arg("notes.md"))?;
-//! println!("replay: {}", outcome.replay_url);
-//! # Ok::<(), termhog::Error>(())
-//! ```
-//!
-//! # Signals
-//!
-//! While a recording runs, signals that would kill the process by default
-//! are handled so the child sees them as it would natively:
-//!
-//! - SIGTERM and SIGHUP are passed to the child. The recording then gets a
-//!   moment to flush and the terminal is restored before the process dies
-//!   from the signal.
-//! - SIGINT and SIGQUIT typed on the terminal (Ctrl+C, Ctrl+\\) reach only
-//!   the child, as they would natively. Ones sent to this process by another
-//!   program (`kill -INT`) are passed to the child.
-//!
-//! Signals the app handles or ignores itself are left alone.
-//!
-//! One case can't be told apart: when the child doesn't get its own
-//! controlling terminal (output isn't a terminal, or this process is a
-//! background job), it shares this process's process group. A signal sent to
-//! the whole group (`kill -INT -<pgid>`) then reaches the child directly and
-//! is also passed on, so the child gets it twice. Signals sent to this
-//! process alone, and keys typed on the terminal, arrive exactly once.
-
+#![doc = include_str!("../README.md")]
 #![warn(missing_docs)]
 
 #[cfg(not(unix))]
-compile_error!("termhog currently supports Unix only");
+compile_error!("termhog doesn't support this platform yet");
 
 mod command;
 mod handoff;
@@ -59,10 +20,11 @@ use std::time::Duration;
 use nix::sys::resource::{Resource, setrlimit};
 use nix::sys::signal::Signal;
 
-pub use command::{Command, Stdio};
+pub use command::{HogCommand, HogStdio};
 pub use session::Recording;
 
 const US_INGEST_HOST: &str = "https://us.i.posthog.com";
+const EU_INGEST_HOST: &str = "https://eu.i.posthog.com";
 
 /// Set TermHog up. Call it as the very first thing in `main`, before
 /// recording anything: [`TermHog::spawn`] panics otherwise.
@@ -88,6 +50,7 @@ const US_INGEST_HOST: &str = "https://us.i.posthog.com";
 /// ```
 pub fn init() {
     handoff::init();
+    tty::install_panic_hook();
 }
 
 /// Errors that stop a recording from starting or finishing.
@@ -100,6 +63,10 @@ pub enum Error {
     /// Another recording in this process already has the terminal.
     #[error("another recording is already attached to this terminal")]
     TerminalBusy,
+    /// The temporary files the recording keeps its data in couldn't be
+    /// created (for example, the temp folder isn't writable).
+    #[error("couldn't create a temporary file for the recording: {0}")]
+    TempFile(#[source] std::io::Error),
     /// The command couldn't be started, like [`std::process::Command::spawn`]
     /// failing (for example, it doesn't exist or isn't executable).
     #[error("{}: {source}", program.to_string_lossy())]
@@ -218,9 +185,8 @@ impl Outcome {
 ///
 /// Replay data waiting to be processed or uploaded is kept in unnamed
 /// temporary files, which disappear with the process. What's handed to the
-/// background uploader (see [`init`]) is saved in the user's cache folder,
-/// readable only by them, until it's uploaded, a week passes, or the folder
-/// passes 100 MB.
+/// background uploader (see [`init`]) is saved in the user's cache folder
+/// until it's uploaded, a week passes, or the folder passes 100 MB.
 #[derive(Clone)]
 pub struct TermHog {
     pub(crate) api_key: String,
@@ -300,12 +266,33 @@ impl TermHog {
     }
 
     /// Start `command` and record it, like [`std::process::Command::spawn`].
-    /// See the [crate docs](crate#signals) for how signals reach the child.
+    ///
+    /// # Signals
+    ///
+    /// While a recording runs, signals that would kill the process by
+    /// default are handled so the child sees them as it would natively:
+    ///
+    /// - SIGTERM and SIGHUP are passed to the child. The recording then gets
+    ///   a moment to flush and the terminal is restored before the process
+    ///   dies from the signal.
+    /// - SIGINT and SIGQUIT typed on the terminal (Ctrl+C, Ctrl+\\) reach
+    ///   only the child, as they would natively. Ones sent to this process by
+    ///   another program (`kill -INT`) are passed to the child.
+    ///
+    /// Signals the app handles or ignores itself are left alone.
+    ///
+    /// One case can't be told apart: when the child doesn't get its own
+    /// controlling terminal (output isn't a terminal, or this process is a
+    /// background job), it shares this process's process group. A signal
+    /// sent to the whole group (`kill -INT -<pgid>`) then reaches the child
+    /// directly and is also passed on, so the child gets it twice. Signals
+    /// sent to this process alone, and keys typed on the terminal, arrive
+    /// exactly once.
     ///
     /// # Panics
     ///
     /// If [`init`] wasn't called first.
-    pub fn spawn(self, command: &mut Command) -> Result<Recording> {
+    pub fn spawn(self, command: &mut HogCommand) -> Result<Recording> {
         if self.api_key.is_empty() {
             return Err(Error::MissingApiKey);
         }
@@ -315,7 +302,7 @@ impl TermHog {
 
     /// Run `command` to completion and record it, like
     /// [`std::process::Command::status`]. Blocks until the child exits.
-    pub fn status(self, command: &mut Command) -> Result<Outcome> {
+    pub fn status(self, command: &mut HogCommand) -> Result<Outcome> {
         self.spawn(command)?.wait()
     }
 
@@ -327,7 +314,7 @@ impl TermHog {
         }
         match self.ingest_host.as_str() {
             US_INGEST_HOST => "https://us.posthog.com".to_string(),
-            "https://eu.i.posthog.com" => "https://eu.posthog.com".to_string(),
+            EU_INGEST_HOST => "https://eu.posthog.com".to_string(),
             other => other.to_string(),
         }
     }

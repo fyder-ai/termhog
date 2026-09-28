@@ -94,7 +94,7 @@ pub fn load(input: impl BufRead) -> Option<Loaded> {
         return None;
     }
     // Rendered events go after the saved ones, into the same spool.
-    let spool = Arc::new(Mutex::new(Spool::new()));
+    let spool = Arc::new(Mutex::new(Spool::new().ok()?));
     let mut resumer = Resumer::new(spool_sink(&spool));
     for line in lines {
         match serde_json::from_str(&line.ok()?) {
@@ -150,7 +150,7 @@ mod tests {
             started_at: 1,
             reporter: None,
         };
-        let mut spool = Spool::new();
+        let mut spool = Spool::new().unwrap();
         spool.push(&json!({ "type": 4, "timestamp": 7 })).unwrap();
         let mut leftovers = Leftovers::new(spool);
         leftovers.ending = Some(Ending {

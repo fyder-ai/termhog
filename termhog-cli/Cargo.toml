@@ -1,6 +1,6 @@
 [package]
 name = "termhog-cli"
-description = "Record terminal sessions as PostHog session replays (CLI)"
+description.workspace = true
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

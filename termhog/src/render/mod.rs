@@ -22,7 +22,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::tty::probe::TerminalInfo;
 use crate::util::{epoch_ms, spawn_recorder};
-use backlog::{Backlog, Chunk};
+pub use backlog::Backlog;
+use backlog::Chunk;
 pub use remainder::{Remainder, Resumer, Saved};
 use screen::Screen;
 pub use screen::Sink;
@@ -132,15 +133,17 @@ impl Feed {
     }
 }
 
-/// Start the render thread, which sends its events to `sink`. Returns the
-/// feed for everything it should show. With `probed`, the host terminal was
-/// asked for its colors, and the first frame waits briefly for them.
+/// Start the render thread, which holds output in `backlog` until it's
+/// rendered and sends its events to `sink`. Returns the feed for everything
+/// it should show. With `probed`, the host terminal was asked for its
+/// colors, and the first frame waits briefly for them.
 ///
 /// The thread gives a [`Remainder`] when it's handed off before finishing,
 /// all wrapped in `None` if it panicked.
 pub fn start(
     (cols, rows): (u16, u16),
     probed: bool,
+    backlog: Backlog,
     sink: Sink,
     on_panic: impl FnOnce(String) + Send + 'static,
 ) -> (Feed, JoinHandle<Option<Option<Remainder>>>) {
@@ -148,7 +151,7 @@ pub fn start(
     let (first_report, first_rx) = bounded(1);
     let feed = Feed {
         tx,
-        backlog: Backlog::default(),
+        backlog,
         hand_off: Arc::new(AtomicBool::new(false)),
         first_report,
     };

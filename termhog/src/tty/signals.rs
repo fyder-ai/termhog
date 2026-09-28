@@ -1,6 +1,6 @@
-//! Signal handling while a recording is live (the behavior is described in
-//! the [crate docs](crate#signals)). Only signals still at their default
-//! action are handled.
+//! Signal handling while a recording is live (the behavior is described on
+//! [`crate::TermHog::spawn`]). Only signals still at their default action
+//! are handled.
 //!
 //! - SIGTERM and SIGHUP (`kill`, `timeout`, a closed terminal) would kill the
 //!   process with the terminal left raw and the recording cut short. They're

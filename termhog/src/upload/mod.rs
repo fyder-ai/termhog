@@ -156,11 +156,12 @@ impl Shared {
     }
 }
 
-/// Start uploading a recording's events. The returned thread ends once
-/// everything is uploaded, or once it's handed off.
-pub fn start(config: Config) -> (Sender<Msg>, JoinHandle<Option<()>>) {
+/// Start uploading a recording's events, queued in `spool` until they're
+/// sent. The returned thread ends once everything is uploaded, or once it's
+/// handed off.
+pub fn start(config: Config, spool: Spool) -> (Sender<Msg>, JoinHandle<Option<()>>) {
     let config = Arc::new(config);
-    let shared = Arc::new(Shared::new(Leftovers::new(Spool::new()), false));
+    let shared = Arc::new(Shared::new(Leftovers::new(spool), false));
     let (tx, rx) = unbounded();
     {
         let (config, shared) = (Arc::clone(&config), Arc::clone(&shared));

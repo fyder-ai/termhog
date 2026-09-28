@@ -237,7 +237,7 @@ mod tests {
 
     #[test]
     fn snapshot_body_is_one_valid_snapshot_event() {
-        let mut spool = Spool::new();
+        let mut spool = Spool::new().unwrap();
         spool.push(&json!({ "type": 4, "timestamp": 7 })).unwrap();
         spool.push(&json!({ "type": 3, "timestamp": 8 })).unwrap();
         let batch = spool.peek(usize::MAX).unwrap().unwrap();

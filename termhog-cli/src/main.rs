@@ -7,7 +7,7 @@ use std::io::{ErrorKind, Write};
 use std::sync::{Arc, Mutex};
 
 use clap::Parser;
-use termhog::{Command, Diagnostic, Error, Reporter, TermHog};
+use termhog::{Diagnostic, Error, HogCommand, Reporter, TermHog};
 
 /// Diagnostics collected during the session, for `main` to print once the
 /// terminal is restored. Printed mid-session, they'd land in the middle of
@@ -48,7 +48,7 @@ struct Cli {
 impl Cli {
     /// The library settings these arguments describe. An empty value (like
     /// `POSTHOG_HOST=`) counts as unset.
-    fn settings(&self, reporter: Arc<dyn Reporter>) -> TermHog {
+    fn to_termhog(&self, reporter: Arc<dyn Reporter>) -> TermHog {
         let set = |value: &Option<String>| value.clone().filter(|v| !v.is_empty());
         let mut settings = TermHog::new(&self.api_key).reporter(reporter);
         if let Some(host) = set(&self.host) {
@@ -73,10 +73,13 @@ impl Cli {
     }
 }
 
-/// Print a message on stderr, ignoring failure. stderr may be a closed pipe
-/// (`termhog -- cmd 2>&1 | head`), where `eprintln!` would panic.
-fn note(message: std::fmt::Arguments) {
-    let _ = writeln!(std::io::stderr(), "termhog: {message}");
+/// Print a message on stderr, like `eprintln!` but ignoring failure. stderr
+/// may be a closed pipe (`termhog -- cmd 2>&1 | head`), where `eprintln!`
+/// would panic.
+macro_rules! note {
+    ($($arg:tt)*) => {{
+        let _ = writeln!(std::io::stderr(), "termhog: {}", format_args!($($arg)*));
+    }};
 }
 
 fn main() {
@@ -93,26 +96,26 @@ fn main() {
         }
     };
 
-    let mut command = Command::new(&cli.command[0]);
+    let mut command = HogCommand::new(&cli.command[0]);
     command.args(&cli.command[1..]);
 
-    let outcome = cli.settings(Arc::new(reporter)).status(&mut command);
+    let outcome = cli.to_termhog(Arc::new(reporter)).status(&mut command);
 
     // Everything below prints only after the terminal is restored.
     if let Ok(messages) = messages.lock() {
         for message in messages.iter() {
-            note(format_args!("{message}"));
+            note!("{message}");
         }
     }
 
     match outcome {
         Ok(outcome) => {
-            note(format_args!("replay → {}", outcome.replay_url));
+            note!("replay → {}", outcome.replay_url);
             // End the way the child did, so callers see the same result.
             outcome.exit();
         }
         Err(e) => {
-            note(format_args!("{e}"));
+            note!("{e}");
             // Like `env`, `timeout` and shells: 127 when the command wasn't
             // found, 126 when it couldn't be run, so callers can tell these
             // apart from the command itself failing.

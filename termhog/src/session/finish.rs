@@ -53,12 +53,16 @@ impl Active {
                 }
             }
             // Rendering is unfinished, so uploading is too. The ending goes
-            // with the rest, for `term_end` once everything's sent.
+            // with the rest, for `term_end` once everything's sent. Without
+            // an upload thread to take the queued events from (it panicked),
+            // the rendering is still saved.
             Some(remainder) => {
-                let mut leftovers = take_leftovers(&self.upload_tx)
-                    .unwrap_or_else(|| Leftovers::new(Spool::in_memory()));
-                leftovers.ending = Some(ending);
-                handoff::hand_off(&self.config, leftovers, Some(remainder));
+                let leftovers = take_leftovers(&self.upload_tx)
+                    .or_else(|| Some(Leftovers::new(Spool::new().ok()?)));
+                if let Some(mut leftovers) = leftovers {
+                    leftovers.ending = Some(ending);
+                    handoff::hand_off(&self.config, leftovers, Some(remainder));
+                }
             }
         }
         // Done or handed off: a pending SIGTERM/SIGHUP may now end the process.

@@ -2,10 +2,10 @@
 //!
 //! Events are kept as JSON Lines in an unnamed temporary file, which leaves
 //! nothing behind even on a crash and keeps memory flat however far uploads
-//! fall behind. Without a temporary file, they're kept in memory.
+//! fall behind.
 
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Cursor, Read, Seek, SeekFrom};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::os::unix::fs::FileExt;
 
 use serde_json::Value;
@@ -21,13 +21,8 @@ pub struct Batch {
     end: u64,
 }
 
-enum Storage {
-    File(File),
-    Memory(Vec<u8>),
-}
-
 pub struct Spool {
-    storage: Storage,
+    file: File,
     /// Position of the oldest event not yet committed.
     read: u64,
     /// Position where the next event is appended.
@@ -39,26 +34,13 @@ pub struct Spool {
 const COMPACT_AFTER: u64 = 8 * 1024 * 1024;
 
 impl Spool {
-    /// An empty spool in an unnamed temporary file, or in memory if no temp
-    /// file can be created.
-    pub fn new() -> Spool {
-        match tempfile::tempfile() {
-            Ok(file) => Spool::with_storage(Storage::File(file)),
-            Err(_) => Spool::in_memory(),
-        }
-    }
-
-    /// An empty spool in memory.
-    pub fn in_memory() -> Spool {
-        Spool::with_storage(Storage::Memory(Vec::new()))
-    }
-
-    fn with_storage(storage: Storage) -> Spool {
-        Spool {
-            storage,
+    /// An empty spool, in a new unnamed temporary file.
+    pub fn new() -> io::Result<Spool> {
+        Ok(Spool {
+            file: tempfile::tempfile()?,
             read: 0,
             write: 0,
-        }
+        })
     }
 
     /// Bytes waiting to be uploaded.
@@ -70,10 +52,7 @@ impl Spool {
         // Serialized JSON never contains a raw newline, so it's one line.
         let mut line = serde_json::to_vec(event)?;
         line.push(b'\n');
-        match &mut self.storage {
-            Storage::File(file) => file.write_all_at(&line, self.write)?,
-            Storage::Memory(buf) => buf.extend_from_slice(&line),
-        }
+        self.file.write_all_at(&line, self.write)?;
         self.write += line.len() as u64;
         Ok(())
     }
@@ -133,15 +112,10 @@ impl Spool {
     }
 
     /// The pending lines, oldest first.
-    fn lines(&mut self) -> io::Result<Box<dyn BufRead + '_>> {
-        let (start, len) = (self.read, self.pending());
-        Ok(match &mut self.storage {
-            Storage::File(file) => {
-                file.seek(SeekFrom::Start(start))?;
-                Box::new(BufReader::new(file.take(len)))
-            }
-            Storage::Memory(buf) => Box::new(Cursor::new(&buf[start as usize..])),
-        })
+    fn lines(&self) -> io::Result<impl BufRead + '_> {
+        let mut file = &self.file;
+        file.seek(SeekFrom::Start(self.read))?;
+        Ok(BufReader::new(file.take(self.pending())))
     }
 
     /// Free the space of committed events: all of it once drained, or by
@@ -150,12 +124,7 @@ impl Spool {
         if self.read == self.write {
             self.read = 0;
             self.write = 0;
-            match &mut self.storage {
-                Storage::File(file) => {
-                    let _ = file.set_len(0);
-                }
-                Storage::Memory(buf) => buf.clear(),
-            }
+            let _ = self.file.set_len(0);
         } else if self.read >= COMPACT_AFTER && self.read > self.pending() {
             // If moving fails, the space is reclaimed on a later attempt.
             if self.move_to_front().is_ok() {
@@ -165,27 +134,19 @@ impl Spool {
         }
     }
 
-    /// Copy the pending lines to the start of the storage and cut it there.
+    /// Copy the pending lines to the start of the file and cut it there.
     /// Done in chunks, so memory stays flat.
-    fn move_to_front(&mut self) -> io::Result<()> {
+    fn move_to_front(&self) -> io::Result<()> {
         let (start, len) = (self.read, self.pending());
-        match &mut self.storage {
-            Storage::File(file) => {
-                let mut buf = vec![0u8; 1024 * 1024];
-                let mut done = 0;
-                while done < len {
-                    let n = buf.len().min((len - done) as usize);
-                    file.read_exact_at(&mut buf[..n], start + done)?;
-                    file.write_all_at(&buf[..n], done)?;
-                    done += n as u64;
-                }
-                file.set_len(len)
-            }
-            Storage::Memory(buf) => {
-                buf.drain(..start as usize);
-                Ok(())
-            }
+        let mut buf = vec![0u8; 1024 * 1024];
+        let mut done = 0;
+        while done < len {
+            let n = buf.len().min((len - done) as usize);
+            self.file.read_exact_at(&mut buf[..n], start + done)?;
+            self.file.write_all_at(&buf[..n], done)?;
+            done += n as u64;
         }
+        self.file.set_len(len)
     }
 }
 
@@ -201,7 +162,7 @@ mod tests {
 
     #[test]
     fn batches_respect_the_size_limit_and_order() {
-        let mut spool = Spool::new();
+        let mut spool = Spool::new().unwrap();
         for i in 0..5 {
             spool.push(&event(100 + i, 10)).unwrap();
         }
@@ -226,7 +187,7 @@ mod tests {
 
     #[test]
     fn compacts_once_most_is_committed() {
-        let mut spool = Spool::new();
+        let mut spool = Spool::new().unwrap();
         for i in 0..12 {
             spool.push(&event(i, 1024 * 1024)).unwrap();
         }

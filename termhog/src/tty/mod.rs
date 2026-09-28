@@ -129,15 +129,18 @@ impl Drop for RawModeGuard {
     }
 }
 
-/// Install (once per process) a panic hook, chained before the previous one.
+/// Install (once per process) a panic hook that runs before the previous
+/// one. [`crate::init`] installs it first thing, so hooks installed later
+/// (like posthog-rs's panic capture) run before it.
 ///
 /// A panic that will end the process restores the terminal first, so the
 /// panic message prints normally and the shell gets a sane terminal back.
 /// That's a panic on the thread that owns the recording, or any panic when
 /// panics abort. Other threads' panics may be caught, and the child is still
-/// using the terminal, so they leave it alone. A recorder thread's panic only
-/// stops the recording (see [`crate::util::spawn_recorder`]), so it's
-/// reported instead of printed over the child's output.
+/// using the terminal, so they leave it raw, with output processing back on
+/// just while their message prints. A recorder thread's panic only stops the
+/// recording (see [`crate::util::spawn_recorder`]), so it's reported instead
+/// of printed over the child's output.
 pub fn install_panic_hook() {
     static INSTALL: Once = Once::new();
     INSTALL.call_once(|| {
@@ -152,10 +155,31 @@ pub fn install_panic_hook() {
                     let _ = tty.write_all(RECOVERY);
                     let _ = tty.flush();
                 }
+                previous(info);
+            } else {
+                with_output_processing(|| previous(info));
             }
-            previous(info);
         }));
     });
+}
+
+/// Run `f` with the terminal's output processing (like turning `\n` into
+/// `\r\n`) back on while raw mode is active, so what it prints looks as it
+/// would natively. The saved state stays locked meanwhile, so raw mode can't
+/// end halfway through and then be set again.
+fn with_output_processing(f: impl FnOnce()) {
+    let saved = saved();
+    let raw = saved.as_ref().and_then(|s| {
+        let raw = termios::tcgetattr(&s.tty).ok()?;
+        let mut printing = raw.clone();
+        printing.output_modes = s.termios.output_modes;
+        termios::tcsetattr(&s.tty, OptionalActions::Now, &printing).ok()?;
+        Some((&s.tty, raw))
+    });
+    f();
+    if let Some((tty, raw)) = raw {
+        let _ = termios::tcsetattr(tty, OptionalActions::Now, &raw);
+    }
 }
 
 /// Whether this thread entered the raw mode that's active.
