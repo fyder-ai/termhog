@@ -9,7 +9,7 @@
 
 use std::fs::{self, DirBuilder, File};
 use std::io::{self, BufWriter};
-use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -21,6 +21,8 @@ use uuid::Uuid;
 const MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Past this total, the oldest checkpoints are deleted unfinished.
 const MAX_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
+/// A temporary file unchanged for this long was left by a writer that died.
+const ABANDONED_AFTER: Duration = Duration::from_secs(10 * 60);
 const EXTENSION: &str = "pending";
 
 /// A checkpoint this process holds the lock on.
@@ -115,11 +117,14 @@ fn write_new(path: &Path, write: impl FnOnce(&mut Writer) -> io::Result<()>) -> 
     temp.persist(path).map_err(|e| e.error)
 }
 
-/// Open `path` and take its lock, unless someone else holds it.
+/// Open `path` and take its lock, unless someone else holds it. The file may
+/// have been replaced (or deleted) between opening and locking it, and the
+/// lock of a file no longer at `path` guards nothing, so that's `None` too.
 fn try_claim(path: &Path) -> Option<File> {
     let file = File::open(path).ok()?;
     flock(&file, FlockOperation::NonBlockingLockExclusive).ok()?;
-    Some(file)
+    let (held, current) = (file.metadata().ok()?, fs::metadata(path).ok()?);
+    (held.dev() == current.dev() && held.ino() == current.ino()).then_some(file)
 }
 
 /// The files in `dir` with extension `ext`, oldest first, with their
@@ -145,16 +150,29 @@ fn tidy(dir: &Path) {
     let checkpoints = files(dir, EXTENSION);
     let mut total: u64 = checkpoints.iter().map(|(_, meta)| meta.len()).sum();
     for (path, meta) in &checkpoints {
-        let age = meta.modified().ok().and_then(|t| t.elapsed().ok());
-        let expired = age.is_some_and(|age| age > MAX_AGE);
-        if (expired || total > MAX_TOTAL_BYTES) && try_claim(path).is_some() {
+        if !older_than(meta, MAX_AGE) && total <= MAX_TOTAL_BYTES {
+            continue;
+        }
+        // Deleted with the lock held, so no one claims it midway.
+        if let Some(_claim) = try_claim(path) {
             let _ = fs::remove_file(path);
             total -= meta.len();
         }
     }
-    for (path, _) in files(dir, "tmp") {
-        if try_claim(&path).is_some() {
+    // A writer's temporary file is unlocked for a moment after it's
+    // created, so only one left unchanged for a while is a dead writer's.
+    for (path, meta) in files(dir, "tmp") {
+        if !older_than(&meta, ABANDONED_AFTER) {
+            continue;
+        }
+        if let Some(_claim) = try_claim(&path) {
             let _ = fs::remove_file(&path);
         }
     }
+}
+
+/// Whether the file was last changed more than `age` ago.
+fn older_than(meta: &fs::Metadata, age: Duration) -> bool {
+    let changed = meta.modified().ok().and_then(|t| t.elapsed().ok());
+    changed.is_some_and(|changed| changed > age)
 }
