@@ -1,0 +1,19 @@
+[package]
+name = "termhog-cli"
+description = "Record terminal sessions as PostHog session replays (CLI)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../README.md"
+keywords = ["posthog", "session-replay", "terminal", "recording", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "termhog"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+termhog = { version = "0.1.0", path = "../termhog" }

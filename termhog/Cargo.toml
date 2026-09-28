@@ -1,0 +1,32 @@
+[package]
+name = "termhog"
+description = "Record terminal sessions as PostHog session replays"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../README.md"
+keywords = ["posthog", "session-replay", "terminal", "pty", "rrweb"]
+categories = ["development-tools", "command-line-interface"]
+
+[dependencies]
+# avt with the erased-cell fix, published as a fork until asciinema releases
+# it (https://github.com/asciinema/avt/pull/29). Imported as `avt`.
+avt = { package = "termhog-avt", version = "0.18" }
+# Minimums are the oldest versions this builds and passes tests with
+# (checked with `cargo update -Z direct-minimal-versions`).
+crossbeam-channel = "0.5"
+dirs = "7"
+flate2 = "1"
+log = "0.4.22"
+nix = { version = "0.31", features = ["poll", "process", "resource", "signal"] }
+rustix = { version = "1", features = ["fs", "process", "pty", "termios"] }
+# 1.0.189 for untagged variants in internally tagged enums (the checkpoint format).
+serde = { version = "1.0.189", features = ["derive"] }
+serde_json = "1.0.25"
+signal-hook = "0.3"
+tempfile = "3"
+thiserror = "2"
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+uuid = { version = "1.6", features = ["v4", "v7"] }
