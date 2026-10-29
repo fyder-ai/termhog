@@ -15,6 +15,8 @@ pub mod probe;
 pub mod pty;
 #[cfg_attr(windows, path = "signals_windows.rs")]
 pub mod signals;
+#[cfg(windows)]
+pub mod spawner;
 
 #[cfg(unix)]
 mod unix;

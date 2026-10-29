@@ -9,14 +9,14 @@
 //! the only one used: Windows can only load and start it from files, so it's
 //! written once into the user's cache folder.
 //!
-//! std can't attach a child to a pseudoconsole, so children are started here
-//! with `CreateProcessW`, following std's rules for the command line,
-//! environment and program lookup.
+//! std can't attach a child to a pseudoconsole on stable Rust, so a copy of
+//! this program is started on it, and starts the child with std (see
+//! `spawner`).
 
-use std::ffi::{OsStr, OsString, c_void};
+use std::ffi::{OsString, c_void};
 use std::fs::File;
-use std::io;
-use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::io::{self, Write};
+use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
 use std::os::windows::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -31,12 +31,14 @@ use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::System::Threading::{
     CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
     EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess, INFINITE,
-    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess,
     PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
     STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
 };
 
 use super::Utf8Output;
+use super::spawner::{self, Request};
 use crate::HogCommand;
 use crate::util::{self, env_block, wide};
 
@@ -295,46 +297,99 @@ pub struct ChildStdio {
 
 impl Pty {
     /// Start `command` attached to the pseudoconsole, with `stdio` for any
-    /// streams that aren't on it.
+    /// streams that aren't on it. std starts it, in a copy of this program
+    /// run on the pseudoconsole as the spawner (see `spawner`).
     pub fn spawn(&self, command: &HogCommand, stdio: &ChildStdio) -> io::Result<Child> {
+        let (request_end, request_write) = util::pipe()?;
+        let mut request_write = File::from(request_write);
+        let (reply_read, reply_end) = util::pipe()?;
+        // Inheritable copies of what the spawner gets, closed once it has
+        // them. The handle list keeps it from inheriting anything else. Our
+        // originals of its pipe ends are closed now, or a pipe would never
+        // end.
+        let request_read = inheritable(&request_end.into())?;
+        let reply_write = inheritable(&reply_end)?;
+        drop(reply_end);
+        let input = stdio.input.as_ref().map(inheritable).transpose()?;
+        let error = stdio.error.as_ref().map(inheritable).transpose()?;
+        let request = Request::new(
+            command,
+            input.as_ref().map(|h| h.as_raw_handle()),
+            error.as_ref().map(|h| h.as_raw_handle()),
+        );
+        let handles = format!(
+            "{},{}",
+            request_read.as_raw_handle() as usize,
+            reply_write.as_raw_handle() as usize
+        );
+        let handle_list = [
+            Some(&request_read),
+            Some(&reply_write),
+            input.as_ref(),
+            error.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|h| h.as_raw_handle())
+        .collect();
+        let spawner = self.start_spawner(&handles, handle_list)?;
+        drop((request_read, reply_write, input, error));
+
+        request_write.write_all(&request.to_line())?;
+        let pid = spawner::read_reply(reply_read)?;
+        // SAFETY: opening a process by ID. The spawner holds the child open
+        // until we close the request pipe below, so the ID is still its.
+        let process = unsafe {
+            OpenProcess(
+                PROCESS_SYNCHRONIZE | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+                0,
+                pid,
+            )
+        };
+        if process.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // Lets the spawner exit.
+        drop(request_write);
+        drop(spawner);
+        Ok(Child::Console {
+            process: unsafe { OwnedHandle::from_raw_handle(process) },
+            pid,
+            console: Arc::clone(&self.console),
+        })
+    }
+
+    /// Start this program on the pseudoconsole as the spawner, with
+    /// `handles` (the request and reply pipes) for it to find and `inherit`
+    /// for it to inherit. Its streams are all the pseudoconsole's.
+    fn start_spawner(&self, handles: &str, inherit: Vec<HANDLE>) -> io::Result<OwnedHandle> {
         // Held until we return, so the pseudoconsole can't close meanwhile.
         let console = self.console.lock();
         let hpc = (*console).ok_or_else(|| io::Error::other("pseudoconsole closed"))?;
-        let env = environment(command);
-        let (program, mut cmdline) = program_and_command_line(command, env.as_deref())?;
-        let program = wide(program.as_os_str());
-        let block = env.map(|vars| env_block(&vars));
-        let cwd = command.current_dir.as_ref().map(|d| wide(d.as_os_str()));
-
-        // Inheritable copies of the child's own handles, closed once it has
-        // them. The handle list keeps it from inheriting anything else.
-        let input = stdio.input.as_ref().map(inheritable).transpose()?;
-        let error = stdio.error.as_ref().map(inheritable).transpose()?;
-        let handle_list: Vec<HANDLE> = [&input, &error]
-            .into_iter()
-            .flatten()
-            .map(|h| h.as_raw_handle())
+        let exe = std::env::current_exe()?;
+        let program = wide(exe.as_os_str());
+        // Its command line is just the program, quoted.
+        let mut cmdline: Vec<u16> = std::iter::once(u16::from(b'"'))
+            .chain(exe.as_os_str().encode_wide())
+            .chain(std::iter::once(u16::from(b'"')))
+            .chain(SPAWNER_ARGS.encode_utf16())
+            .chain(std::iter::once(0))
             .collect();
-        let inherit = !handle_list.is_empty();
-        let attributes = AttributeList::new(hpc, handle_list)?;
+        let mut vars: Vec<(OsString, OsString)> = std::env::vars_os()
+            .filter(|(key, _)| !key.eq_ignore_ascii_case(spawner::VAR))
+            .collect();
+        vars.push((spawner::VAR.into(), handles.into()));
+        let block = env_block(&vars);
+
+        let attributes = AttributeList::new(hpc, inherit)?;
         // SAFETY: zeroed STARTUPINFOEXW is the documented starting point.
         let mut si: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
         si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
         si.lpAttributeList = attributes.as_ptr();
-        // Every stream is set: a null handle puts it on the pseudoconsole.
-        // Left unset, a child of a process whose own stdio is redirected
-        // would write to that redirect instead. INVALID_HANDLE_VALUE, which
-        // works when all three are, left a console stream nowhere once
-        // another stream had a real handle (Windows 11 26100).
-        let raw = |h: &Option<OwnedHandle>| {
-            h.as_ref()
-                .map_or(std::ptr::null_mut(), |h| h.as_raw_handle())
-        };
+        // Null handles put every stream on the pseudoconsole. Left unset, a
+        // child of a process whose own stdio is redirected would write to
+        // that redirect instead.
         si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-        si.StartupInfo.hStdInput = raw(&input);
-        si.StartupInfo.hStdOutput = std::ptr::null_mut();
-        si.StartupInfo.hStdError = raw(&error);
-
         let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: every pointer is valid for the call. Only the handles in
         // the list are inherited, and the pseudoconsole is an attribute.
@@ -344,12 +399,10 @@ impl Pty {
                 cmdline.as_mut_ptr(),
                 std::ptr::null(),
                 std::ptr::null(),
-                inherit.into(),
+                1,
                 EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
-                block
-                    .as_ref()
-                    .map_or(std::ptr::null(), |b| b.as_ptr() as *const c_void),
-                cwd.as_ref().map_or(std::ptr::null(), |d| d.as_ptr()),
+                block.as_ptr() as *const c_void,
+                std::ptr::null(),
                 &si.StartupInfo,
                 &mut pi,
             )
@@ -359,36 +412,16 @@ impl Pty {
         }
         // SAFETY: both handles are ours now.
         unsafe { CloseHandle(pi.hThread) };
-        Ok(Child::Console {
-            process: unsafe { OwnedHandle::from_raw_handle(pi.hProcess) },
-            pid: pi.dwProcessId,
-            console: Arc::clone(&self.console),
-        })
+        Ok(unsafe { OwnedHandle::from_raw_handle(pi.hProcess) })
     }
 }
 
-/// The program `CreateProcessW` runs for `command`, found the way std finds
-/// it in the child's PATH, and its command line. A batch file runs under
-/// cmd.exe, which parses its command line again, so it gets cmd's escaping
-/// too (see `batch_command_line`).
-fn program_and_command_line(
-    command: &HogCommand,
-    env: Option<&[(OsString, OsString)]>,
-) -> io::Result<(PathBuf, Vec<u16>)> {
-    let path = env
-        .and_then(|vars| vars.iter().find(|(k, _)| k.eq_ignore_ascii_case("PATH")))
-        .map(|(_, v)| v.clone())
-        .or_else(|| std::env::var_os("PATH"));
-    let program = resolve(&command.program, path.as_deref())?;
-    if is_batch(&program) {
-        // cmd.exe would look for a relative script in the child's folder, so
-        // it's made absolute against ours, as std does.
-        let script = std::path::absolute(&program)?;
-        return Ok((system_cmd()?, batch_command_line(&script, &command.args)?));
-    }
-    let cmdline = command_line(&program, &command.args)?;
-    Ok((program, cmdline))
-}
+/// Arguments after the program on the spawner's command line. The test
+/// harness runs only the test that acts as the spawner.
+#[cfg(not(test))]
+const SPAWNER_ARGS: &str = "";
+#[cfg(test)]
+const SPAWNER_ARGS: &str = " tty::pty::tests::spawner --exact --quiet";
 
 /// A process thread attribute list holding a pseudoconsole, and the handles
 /// the child may inherit when there are any. The list points into `handles`,
@@ -484,200 +517,6 @@ fn inheritable(handle: &OwnedHandle) -> io::Result<OwnedHandle> {
     Ok(unsafe { OwnedHandle::from_raw_handle(copy) })
 }
 
-/// The child's environment, when the command changes it. `None` inherits
-/// ours unchanged. Names match case-insensitively, as on Windows.
-fn environment(command: &HogCommand) -> Option<Vec<(OsString, OsString)>> {
-    if !command.env_clear && command.envs.is_empty() {
-        return None;
-    }
-    let mut vars: Vec<(OsString, OsString)> = if command.env_clear {
-        Vec::new()
-    } else {
-        std::env::vars_os().collect()
-    };
-    for (key, val) in &command.envs {
-        vars.retain(|(k, _)| !k.eq_ignore_ascii_case(key));
-        if let Some(val) = val {
-            vars.push((key.clone(), val.clone()));
-        }
-    }
-    Some(vars)
-}
-
-/// Find `program` the way std does: a path is used as given, a bare name is
-/// searched for in `path` (the child's PATH). Either gets `.exe` added when
-/// it has no extension.
-fn resolve(program: &OsStr, path: Option<&OsStr>) -> io::Result<PathBuf> {
-    let with_exe = |p: PathBuf| -> PathBuf {
-        if p.extension().is_some() {
-            p
-        } else {
-            p.with_extension("exe")
-        }
-    };
-    let candidate = Path::new(program);
-    if candidate.components().count() > 1 || candidate.is_absolute() {
-        return Ok(with_exe(candidate.to_path_buf()));
-    }
-    for dir in path.into_iter().flat_map(std::env::split_paths) {
-        // An empty or relative entry (a trailing separator makes one) would
-        // search the current folder, which std never does.
-        if !dir.is_absolute() {
-            continue;
-        }
-        let full = with_exe(dir.join(program));
-        if full.is_file() {
-            return Ok(full);
-        }
-    }
-    Err(io::Error::new(io::ErrorKind::NotFound, "program not found"))
-}
-
-/// The command line `CreateProcessW` takes, quoted so the child's C runtime
-/// splits it back into exactly these arguments.
-fn command_line(program: &Path, args: &[OsString]) -> io::Result<Vec<u16>> {
-    let mut line = Vec::new();
-    let program = program.as_os_str();
-    if program.encode_wide().any(|c| c == u16::from(b'"')) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "program path contains a quote",
-        ));
-    }
-    line.push(u16::from(b'"'));
-    line.extend(program.encode_wide());
-    line.push(u16::from(b'"'));
-    for arg in args {
-        line.push(u16::from(b' '));
-        append_quoted(&mut line, arg);
-    }
-    line.push(0);
-    Ok(line)
-}
-
-/// Append `arg`, quoted if needed: backslashes are literal except before a
-/// quote, where they and the quote are escaped.
-fn append_quoted(line: &mut Vec<u16>, arg: &OsStr) {
-    let arg: Vec<u16> = arg.encode_wide().collect();
-    let special = |c: &u16| [b' ', b'\t', b'\n', 0x0b, b'"'].contains(&(*c as u8)) && *c < 0x80;
-    if !arg.is_empty() && !arg.iter().any(special) {
-        line.extend(&arg);
-        return;
-    }
-    line.push(u16::from(b'"'));
-    let mut backslashes = 0;
-    for &c in &arg {
-        if c == u16::from(b'\\') {
-            backslashes += 1;
-        } else {
-            if c == u16::from(b'"') {
-                // Escape the backslashes before it, then the quote itself.
-                line.extend(std::iter::repeat_n(u16::from(b'\\'), backslashes + 1));
-            }
-            backslashes = 0;
-        }
-        line.push(c);
-    }
-    // Backslashes before the closing quote are doubled.
-    line.extend(std::iter::repeat_n(u16::from(b'\\'), backslashes));
-    line.push(u16::from(b'"'));
-}
-
-/// Whether `program` is a batch file, which Windows runs with cmd.exe.
-fn is_batch(program: &Path) -> bool {
-    program
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("bat") || ext.eq_ignore_ascii_case("cmd"))
-}
-
-/// The system's cmd.exe, by full path, so no other folder can supply one.
-fn system_cmd() -> io::Result<PathBuf> {
-    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
-    let mut buf = [0u16; 260];
-    // SAFETY: `buf` holds `len` units.
-    let len = unsafe { GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32) } as usize;
-    if len == 0 || len >= buf.len() {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(PathBuf::from(OsString::from_wide(&buf[..len])).join("cmd.exe"))
-}
-
-/// The command line that runs `script` with `args` under cmd.exe, escaped
-/// the way std does it (since Rust 1.77.2, for CVE-2024-24576), so no
-/// argument can end the command and start another.
-///
-/// cmd.exe parses its command line itself, ignoring the C runtime's quoting
-/// rules, and expands `%VAR%` even inside quotes. So, as std does: run with
-/// command extensions on (`/e:ON`), delayed `!VAR!` expansion off
-/// (`/v:OFF`), and no AutoRun commands (`/d`). Quote any argument that
-/// isn't plainly safe, escape `"` as `""` so quotes stay balanced, and
-/// escape `%` as `%%cd:~,%`, where `%cd:~,%` expands to nothing and leaves
-/// the `%`. Line breaks would end the command, so they're refused.
-fn batch_command_line(script: &Path, args: &[OsString]) -> io::Result<Vec<u16>> {
-    let invalid = |msg| io::Error::new(io::ErrorKind::InvalidInput, msg);
-    let script: Vec<u16> = script.as_os_str().encode_wide().collect();
-    if script.contains(&u16::from(b'"')) || script.last() == Some(&u16::from(b'\\')) {
-        return Err(invalid(
-            "batch file path contains a quote or ends with a backslash",
-        ));
-    }
-    let mut line: Vec<u16> = "cmd.exe /e:ON /v:OFF /d /c \"".encode_utf16().collect();
-    line.push(u16::from(b'"'));
-    line.extend(&script);
-    line.push(u16::from(b'"'));
-    for arg in args {
-        let arg: Vec<u16> = arg.encode_wide().collect();
-        if arg
-            .iter()
-            .any(|&c| c == 0 || c == u16::from(b'\r') || c == u16::from(b'\n'))
-        {
-            return Err(invalid("batch file arguments are invalid"));
-        }
-        line.push(u16::from(b' '));
-        // As std does: quote unless every ASCII character is known to be
-        // safe, rather than trying to list every unsafe one. Also quote an
-        // empty argument, or it vanishes, and one ending in `\`, or a script
-        // using `"%~1"` gets its closing quote escaped.
-        const UNQUOTED: &[u8] = b"#$*+-./:?@\\_";
-        let needs_quotes = |c: char| {
-            (c.is_ascii() && !(c.is_ascii_alphanumeric() || UNQUOTED.contains(&(c as u8))))
-                || c.is_control()
-        };
-        let quote = arg.is_empty()
-            || arg.last() == Some(&u16::from(b'\\'))
-            || char::decode_utf16(arg.iter().copied()).any(|c| c.is_ok_and(needs_quotes));
-        if quote {
-            line.push(u16::from(b'"'));
-        }
-        let mut backslashes = 0;
-        for &c in &arg {
-            if c == u16::from(b'\\') {
-                backslashes += 1;
-            } else {
-                if c == u16::from(b'"') {
-                    // Escape the backslashes before it for the script's own
-                    // argument parsing, then double the quote for cmd.
-                    line.extend(std::iter::repeat_n(u16::from(b'\\'), backslashes));
-                    line.push(u16::from(b'"'));
-                }
-                backslashes = 0;
-            }
-            if c == u16::from(b'%') {
-                line.extend("%%cd:~,".encode_utf16());
-            }
-            line.push(c);
-        }
-        if quote {
-            line.extend(std::iter::repeat_n(u16::from(b'\\'), backslashes));
-            line.push(u16::from(b'"'));
-        }
-    }
-    // Close the quote that wraps the whole command.
-    line.push(u16::from(b'"'));
-    line.push(0);
-    Ok(line)
-}
-
 /// The recorded child: started by std (its output through pipes), or on a
 /// pseudoconsole. Mirrors [`std::process::Child`]'s waiting and killing.
 pub enum Child {
@@ -758,21 +597,13 @@ mod tests {
 
     use super::*;
 
-    fn quoted(arg: &str) -> String {
-        let mut line = Vec::new();
-        append_quoted(&mut line, OsStr::new(arg));
-        String::from_utf16(&line).unwrap()
-    }
-
+    /// The spawner, when the harness is started as one (see `SPAWNER_ARGS`).
+    /// Otherwise it does nothing.
     #[test]
-    fn quoting_follows_the_c_runtime() {
-        assert_eq!(quoted("plain"), "plain");
-        assert_eq!(quoted(""), "\"\"");
-        assert_eq!(quoted("two words"), "\"two words\"");
-        assert_eq!(quoted("say \"hi\""), "\"say \\\"hi\\\"\"");
-        assert_eq!(quoted("C:\\dir\\"), "C:\\dir\\");
-        assert_eq!(quoted("C:\\my dir\\"), "\"C:\\my dir\\\\\"");
-        assert_eq!(quoted("a\\\\\"b"), "\"a\\\\\\\\\\\"b\"");
+    fn spawner() {
+        if let Some(handles) = std::env::var_os(spawner::VAR) {
+            spawner::run(&handles);
+        }
     }
 
     #[test]
@@ -787,17 +618,20 @@ mod tests {
     }
 
     #[test]
-    fn env_changes_match_names_case_insensitively() {
-        let mut command = HogCommand::new("x");
-        command.env_clear().env("Path", "a").env("PATH", "b");
-        let vars = environment(&command).unwrap();
-        assert_eq!(vars, vec![(OsString::from("PATH"), OsString::from("b"))]);
-    }
-
-    #[test]
-    fn missing_program_is_not_found() {
-        let err = resolve(OsStr::new("no-such-program-xyz"), Some(OsStr::new("C:\\"))).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    fn spawn_errors_come_back_as_std_reported_them() {
+        let pty = open((80, 24), false, None).unwrap();
+        let kind = |command: &HogCommand| {
+            let result = pty.spawn(command, &ChildStdio::default());
+            result.err().expect("the spawn should fail").kind()
+        };
+        assert_eq!(
+            kind(&HogCommand::new("no-such-program-xyz")),
+            io::ErrorKind::NotFound
+        );
+        // One std refuses itself, without an OS error.
+        let mut command = HogCommand::new("cmd");
+        command.arg("a\0b");
+        assert_eq!(kind(&command), io::ErrorKind::InvalidInput);
     }
 
     #[test]
@@ -821,27 +655,6 @@ mod tests {
         console.close();
         let text = String::from_utf8_lossy(&reader.join().unwrap()).into_owned();
         assert!(text.contains("pseudoconsole-ok"), "output: {text:?}");
-    }
-
-    #[test]
-    fn batch_arguments_are_escaped_for_cmd() {
-        let line = batch_command_line(
-            Path::new("C:\\t\\x.bat"),
-            &[
-                OsString::from("a b"),
-                OsString::from("\"&calc"),
-                OsString::from("5%"),
-            ],
-        )
-        .unwrap();
-        let line = String::from_utf16(&line[..line.len() - 1]).unwrap();
-        assert_eq!(
-            line,
-            "cmd.exe /e:ON /v:OFF /d /c \"\"C:\\t\\x.bat\" \"a b\" \"\"\"&calc\" \"5%%cd:~,%\"\""
-        );
-        for bad in ["a\nb", "a\rb", "a\0b"] {
-            assert!(batch_command_line(Path::new("x.bat"), &[OsString::from(bad)]).is_err());
-        }
     }
 
     /// Runs a batch file that records its arguments, through std (the

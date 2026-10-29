@@ -45,6 +45,10 @@ const EU_INGEST_HOST: &str = "https://eu.i.posthog.com";
 /// termhog::init();
 /// ```
 pub fn init() {
+    #[cfg(windows)]
+    if let Some(handles) = std::env::var_os(tty::spawner::VAR) {
+        tty::spawner::run(&handles);
+    }
     handoff::init();
     tty::install_panic_hook();
 }
