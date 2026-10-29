@@ -40,6 +40,13 @@ struct Cli {
     #[arg(long, env = "POSTHOG_SESSION_ID", hide_env_values = true)]
     session_id: Option<String>,
 
+    /// A folder TermHog may run its helper executables from (Microsoft's
+    /// ConPTY), for machines that only allow some folders. Defaults to the
+    /// user's cache folder.
+    #[cfg(windows)]
+    #[arg(long, env = "TERMHOG_EXECUTABLE_DIR")]
+    executable_dir: Option<std::path::PathBuf>,
+
     /// The command to run, e.g. `termhog -- nvim`.
     #[arg(trailing_var_arg = true, required = true, num_args = 1.., value_name = "COMMAND")]
     command: Vec<OsString>,
@@ -62,6 +69,14 @@ impl Cli {
         }
         if let Some(id) = set(&self.session_id) {
             settings = settings.session_id(id);
+        }
+        #[cfg(windows)]
+        if let Some(dir) = self
+            .executable_dir
+            .clone()
+            .filter(|d| !d.as_os_str().is_empty())
+        {
+            settings = settings.executable_dir(dir);
         }
         // Without a terminal (CI logs, pipes), record the size the shell says
         // it has. Malformed values are ignored rather than failing the run.

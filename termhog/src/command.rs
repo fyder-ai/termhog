@@ -8,7 +8,10 @@
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
-use std::os::fd::OwnedFd;
+#[cfg(unix)]
+use std::os::fd::OwnedFd as OwnedStream;
+#[cfg(windows)]
+use std::os::windows::io::OwnedHandle as OwnedStream;
 use std::path::{Path, PathBuf};
 use std::process::{ChildStderr, ChildStdin, ChildStdout};
 
@@ -22,7 +25,7 @@ pub(crate) enum StdioKind {
     Null,
     Piped,
     /// A file, pipe end, or other open file the stream is connected to.
-    Fd(OwnedFd),
+    Fd(OwnedStream),
 }
 
 impl HogStdio {
@@ -68,18 +71,18 @@ macro_rules! stdio_from {
     )*};
 }
 
-stdio_from!(File, OwnedFd, ChildStdin, ChildStdout, ChildStderr);
+stdio_from!(File, OwnedStream, ChildStdin, ChildStdout, ChildStderr);
 
 /// A process builder with the same API and defaults as [`std::process::Command`].
 /// Every stream defaults to inherit.
 #[derive(Debug)]
 pub struct HogCommand {
     pub(crate) program: OsString,
-    args: Vec<OsString>,
+    pub(crate) args: Vec<OsString>,
     /// Ordered env edits. `None` removes the variable.
-    envs: Vec<(OsString, Option<OsString>)>,
-    env_clear: bool,
-    current_dir: Option<PathBuf>,
+    pub(crate) envs: Vec<(OsString, Option<OsString>)>,
+    pub(crate) env_clear: bool,
+    pub(crate) current_dir: Option<PathBuf>,
     pub(crate) stdin: HogStdio,
     pub(crate) stdout: HogStdio,
     pub(crate) stderr: HogStdio,

@@ -3,23 +3,31 @@
 
 mod finish;
 mod pump;
+#[cfg(unix)]
+mod unix;
+#[cfg(windows)]
+mod windows;
 
+use std::fs::File;
 use std::io;
-use std::os::fd::{AsFd, BorrowedFd};
-use std::process::{Child, ChildStderr, ChildStdin, ChildStdout};
+use std::process::{ChildStderr, ChildStdin, ChildStdout};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
-use rustix::termios;
 use uuid::Uuid;
 
 use crate::render::Remainder;
-use crate::tty::{self, pty, signals};
+use crate::tty::pty::Child;
+use crate::tty::signals;
 use crate::upload::spool::Spool;
 use crate::util::{self, epoch_ms};
-use crate::{Error, HogCommand, HogStdio, Outcome, Result, TermHog, handoff, render, upload};
-use pump::{Attached, Attachment, Source};
+use crate::{Error, HogCommand, Outcome, Result, TermHog, handoff, render, upload};
+use pump::{Attached, Attachment, PtyOutput, Source};
+#[cfg(unix)]
+use unix::start_child;
+#[cfg(windows)]
+use windows::start_child;
 
 /// A running, recorded child. Mirrors [`std::process::Child`].
 ///
@@ -65,12 +73,50 @@ struct Active {
     signals: signals::Guard,
 }
 
+impl Active {
+    /// Wait for the child to exit, without collecting its status (see
+    /// [`Active::reap`]). With `nohang`, only checks. Returns whether it has
+    /// exited.
+    fn wait_exited(&self, nohang: bool) -> io::Result<bool> {
+        // On Unix by process ID, which stays the child's until it's reaped.
+        #[cfg(unix)]
+        return util::wait_exited(self.child.id(), nohang);
+        // On Windows through the handle the child holds.
+        #[cfg(windows)]
+        return util::wait_exited(&self.child, nohang);
+    }
+
+    /// Collect the exited child's status. On Unix that goes through the
+    /// signal guard, so no signal is ever sent to its reused process ID.
+    fn reap(&mut self) -> io::Result<std::process::ExitStatus> {
+        #[cfg(unix)]
+        return self.signals.reap(&mut self.child);
+        #[cfg(windows)]
+        return self.child.wait();
+    }
+}
+
+/// A child the platform started (see `unix.rs` and `windows.rs`), and how
+/// its output reaches us.
+struct Started {
+    child: Child,
+    start: Instant,
+    /// Our ends of the streams the command set to [`crate::HogStdio::piped`].
+    stdin: Option<ChildStdin>,
+    stdout: Option<ChildStdout>,
+    stderr: Option<ChildStderr>,
+    /// The terminal, when the child runs on a pty that takes it over.
+    attachment: Option<Attachment>,
+    /// The pty's output, mirrored to stdout. The pty merges every stream
+    /// attached to it, and only exists when stdout is the terminal.
+    pty_output: Option<PtyOutput>,
+    /// Output pipes to tee, each with whether it goes to stderr (else stdout).
+    tees: Vec<(File, bool)>,
+    size: (u16, u16),
+}
+
 /// Spawn and record `command`. See [`TermHog::spawn`].
 pub fn spawn(settings: TermHog, command: &mut HogCommand) -> Result<Recording> {
-    let out_tty = command.stdout.is_inherit() && termios::isatty(io::stdout());
-    let err_tty = command.stderr.is_inherit() && termios::isatty(io::stderr());
-    let in_tty = command.stdin.is_inherit() && termios::isatty(io::stdin());
-
     // Where the recording's data waits to be rendered and uploaded.
     let backlog = render::Backlog::new().map_err(Error::TempFile)?;
     let spool = Spool::new().map_err(Error::TempFile)?;
@@ -79,81 +125,20 @@ pub fn spawn(settings: TermHog, command: &mut HogCommand) -> Result<Recording> {
     // in place before raw mode, and gets the child once there is one.
     let signals = signals::watch();
 
-    // Only take over the terminal when stdout is on it. When just stderr is
-    // (e.g. `termhog -- make | less`), the terminal belongs to the next
-    // program in the pipeline, so stderr is recorded through a pipe instead.
-    let host = if out_tty {
-        Attachment::open(settings.fallback_size)?
-    } else {
-        None
-    };
-    // When stdout is a terminal we can't take over (we're a background job,
-    // or it isn't our controlling terminal), the child still gets a terminal
-    // for its output, with the same settings and size, while its input stays
-    // exactly as it is natively. If that can't be set up, it gets a pipe.
-    let (attachment, pty, (cols, rows)) = match host {
-        Some((attachment, pty)) => {
-            let size = attachment.size;
-            (Some(attachment), Some(pty), size)
-        }
-        None if out_tty => {
-            let size = tty::winsize(io::stdout()).unwrap_or(settings.fallback_size);
-            let termios = termios::tcgetattr(io::stdout()).ok();
-            (None, termios.and_then(|t| pty::open(size, &t).ok()), size)
-        }
-        None => (None, None, settings.fallback_size),
-    };
-
-    // Streams the caller redirected go to std untouched. Inherited ones on
-    // stdout's terminal are swapped for the pty (stdin only when input is
-    // forwarded). Other inherited output goes through a pipe we tee, except
-    // stderr on a different terminal than a pty-backed stdout, which keeps
-    // its terminal.
-    let slave = pty.as_ref().map(|p| &p.slave);
-    let on_stdout_terminal = |fd: BorrowedFd| tty::same_terminal(fd, io::stdout());
-    let in_pty = attachment.is_some() && in_tty && on_stdout_terminal(io::stdin().as_fd());
-    let err_pty = slave.is_some() && err_tty && on_stdout_terminal(io::stderr().as_fd());
-    let tee_stdout = slave.is_none() && command.stdout.is_inherit();
-    let tee_stderr = command.stderr.is_inherit() && !(slave.is_some() && err_tty);
-    // Output that all goes to one place (like `2>&1`) arrives there in the
-    // order it's written, so it gets one pipe, read in order, not one each.
-    let merged = if tee_stdout && tee_stderr && util::same_file(io::stdout(), io::stderr()) {
-        Some(util::pipe()?)
-    } else {
-        None
-    };
-    let stdio = |on_pty: bool, tee: bool, spec: &HogStdio| -> io::Result<_> {
-        Ok(match (slave, &merged) {
-            (Some(slave), _) if on_pty => slave.try_clone()?.into(),
-            (_, Some((_, write))) if tee => write.try_clone()?.into(),
-            _ if tee => std::process::Stdio::piped(),
-            _ => spec.to_std()?,
-        })
-    };
-    let mut std_cmd = command.to_std();
-    std_cmd.stdin(stdio(in_pty, false, &command.stdin)?);
-    std_cmd.stdout(stdio(true, tee_stdout, &command.stdout)?);
-    std_cmd.stderr(stdio(err_pty, tee_stderr, &command.stderr)?);
-    // Only a child whose terminal we fully manage gets it as its controlling
-    // terminal. Otherwise it keeps ours, with native job control.
-    if let (Some(slave), Some(_)) = (slave, &attachment) {
-        pty::make_controlling(&mut std_cmd, slave);
-    }
-
-    // Everything that can fail happened before the child exists, so an error
-    // never leaves it running unattended.
-    let mut child = std_cmd.spawn().map_err(|source| Error::Spawn {
-        program: command.program.clone(),
-        source,
-    })?;
-    let start = Instant::now();
-    // Drop every slave and pipe write end we hold, so readers see EOF once
-    // the child exits.
-    drop(std_cmd);
-    let master = pty.map(|pty| pty.master);
-    let merged = merged.map(|(read, _write)| read);
+    let Started {
+        child,
+        start,
+        stdin,
+        stdout,
+        stderr,
+        attachment,
+        pty_output,
+        tees,
+        size: (cols, rows),
+    } = start_child(&settings, command)?;
     // A child with its own controlling terminal leads its own process group,
     // so signals go to the whole group.
+    #[cfg(unix)]
     signals.set_child(child.id(), attachment.is_some());
 
     let session_id = settings
@@ -174,30 +159,25 @@ pub fn spawn(settings: TermHog, command: &mut HogCommand) -> Result<Recording> {
     let on_panic = config.on_panic();
     let (feed, render_handle) = render::start((cols, rows), probed, backlog, sink, on_panic);
 
-    // Output readers. The pty merges every stream attached to it, mirrored to
-    // stdout (a pty only exists when stdout is the terminal).
-    let pty_reader = master.map(|master| {
+    // Output readers.
+    let pty_reader = pty_output.map(|output| {
         let feed = feed.clone();
-        thread::spawn(move || pump::read_loop(master, io::stdout(), Source::Pty, feed))
+        thread::spawn(move || pump::read_loop(output, io::stdout(), Source::Pty, feed))
     });
-    let (mut stdout, mut stderr) = (child.stdout.take(), child.stderr.take());
-    let mut pipe_readers = Vec::new();
-    if let Some(pipe) = merged {
-        pipe_readers.push(pump::tee(pipe, io::stdout(), &feed));
-    } else {
-        if tee_stdout {
-            let pipe = stdout.take().expect("piped stdout");
-            pipe_readers.push(pump::tee(pipe, io::stdout(), &feed));
-        }
-        if tee_stderr {
-            let pipe = stderr.take().expect("piped stderr");
-            pipe_readers.push(pump::tee(pipe, io::stderr(), &feed));
-        }
-    }
+    let pipe_readers = tees
+        .into_iter()
+        .map(|(pipe, to_stderr)| {
+            if to_stderr {
+                pump::tee(pipe, io::stderr(), &feed)
+            } else {
+                pump::tee(pipe, io::stdout(), &feed)
+            }
+        })
+        .collect();
     let attached = attachment.map(|a| a.start(&feed));
 
     Ok(Recording {
-        stdin: child.stdin.take(),
+        stdin,
         stdout,
         stderr,
         pid: child.id(),
@@ -281,11 +261,12 @@ impl Recording {
         if let Some(outcome) = &self.outcome {
             return Ok(Some(outcome.clone()));
         }
-        if !util::wait_exited(self.pid, nohang)? {
+        let active = self.active.as_ref().expect("active until the outcome");
+        if !active.wait_exited(nohang)? {
             return Ok(None);
         }
         let mut active = self.active.take().expect("active until the outcome");
-        let status = match active.signals.reap(&mut active.child) {
+        let status = match active.reap() {
             Ok(status) => status,
             Err(e) => {
                 // Left in place to try again, as std's `wait` does.
@@ -327,10 +308,9 @@ impl Drop for Recording {
             attached.detach();
         }
         // Finish the recording once the child exits, without waiting here.
-        let pid = self.pid;
         thread::spawn(move || {
-            if util::wait_exited(pid, false).is_ok() {
-                if let Ok(status) = active.signals.reap(&mut active.child) {
+            if active.wait_exited(false).is_ok() {
+                if let Ok(status) = active.reap() {
                     active.finish(status);
                 }
             }

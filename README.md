@@ -51,6 +51,13 @@ background upload can't finish (the machine shut down, say) is picked up by
 the next `init`. In CI, where leftover processes don't outlive the job,
 nothing is started in the background.
 
+### Windows
+
+TermHog writes the helper executables it needs into the user's cache folder
+and runs them from there. Where only some folders may run executables, set
+`TermHog::executable_dir` to one of them. It must not be writable by other
+users, since TermHog runs what it finds there.
+
 ## CLI
 
 ```bash
@@ -74,6 +81,7 @@ counts as unset). Flags go before the `--`:
 - `--ui-host` / `POSTHOG_UI_HOST`: replay-UI host, for ingestion behind a proxy. Defaults to the ingestion host.
 - `--distinct-id` / `POSTHOG_DISTINCT_ID`: the person ID. Without it, recordings are anonymous, and PostHog creates no person profile for them.
 - `--session-id` / `POSTHOG_SESSION_ID`: the session ID, so external events can share it. Defaults to a fresh UUIDv7.
+- `--executable-dir` / `TERMHOG_EXECUTABLE_DIR` (Windows only): a folder TermHog may run its helper executables from (see [Windows](#windows)). Defaults to the user's cache folder.
 
 When output isn't a terminal (CI logs, pipes), the recorded screen size comes
 from `COLUMNS` and `LINES` if both are set, and is 80x24 otherwise.

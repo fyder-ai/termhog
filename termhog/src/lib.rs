@@ -1,7 +1,7 @@
 #![doc = include_str!("../README.md")]
 #![warn(missing_docs)]
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 compile_error!("termhog doesn't support this platform yet");
 
 mod command;
@@ -12,13 +12,9 @@ mod tty;
 mod upload;
 mod util;
 
-use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
 use std::sync::Arc;
 use std::time::Duration;
-
-use nix::sys::resource::{Resource, setrlimit};
-use nix::sys::signal::Signal;
 
 pub use command::{HogCommand, HogStdio};
 pub use session::Recording;
@@ -162,14 +158,12 @@ impl Outcome {
     /// script when a command is killed by Ctrl+C, but not when one merely
     /// exits with 130. Core dumps are disabled first, so a crashed child
     /// (SIGSEGV, SIGABRT) doesn't also produce a core of this process.
+    ///
+    /// On Windows there are no signals: the child's exit code is reused as
+    /// is (a Ctrl+C exit is `0xC000013A`).
     pub fn exit(&self) -> ! {
-        if let Some(signal) = self.status.signal().and_then(|s| Signal::try_from(s).ok()) {
-            let _ = setrlimit(Resource::RLIMIT_CORE, 0, 0);
-            // Crash handlers like systemd-coredump ignore the core limit.
-            #[cfg(target_os = "linux")]
-            let _ = nix::sys::prctl::set_dumpable(false);
-            util::die_from(signal);
-        }
+        #[cfg(unix)]
+        util::die_like(self.status);
         // Not killed by a signal (or it didn't end us): exit with the code.
         std::process::exit(self.exit_code())
     }
@@ -197,6 +191,8 @@ pub struct TermHog {
     pub(crate) reporter: Option<Arc<dyn Reporter>>,
     pub(crate) fallback_size: (u16, u16),
     pub(crate) finish_timeout: Option<Duration>,
+    #[cfg(windows)]
+    pub(crate) executable_dir: Option<std::path::PathBuf>,
 }
 
 impl TermHog {
@@ -211,6 +207,8 @@ impl TermHog {
             reporter: None,
             fallback_size: (80, 24),
             finish_timeout: None,
+            #[cfg(windows)]
+            executable_dir: None,
         }
     }
 
@@ -262,6 +260,24 @@ impl TermHog {
     /// Defaults to 0.3 seconds, or 20 seconds in CI.
     pub fn finish_timeout(mut self, timeout: Duration) -> TermHog {
         self.finish_timeout = Some(timeout);
+        self
+    }
+
+    /// A folder TermHog may put executables in and run them from, for
+    /// machines where only some folders may run executables. Defaults to the
+    /// user's cache folder.
+    ///
+    /// Recording on a console needs Microsoft's ConPTY (`conpty.dll` and
+    /// `OpenConsole.exe`), which is embedded in TermHog and written to a
+    /// `termhog\conpty\<version>` folder inside this one on first use. It's
+    /// loaded once per process, so the first recording that needs it decides
+    /// where it's written.
+    ///
+    /// The folder must not be writable by other users, since TermHog runs
+    /// what it finds there.
+    #[cfg(windows)]
+    pub fn executable_dir(mut self, dir: impl Into<std::path::PathBuf>) -> TermHog {
+        self.executable_dir = Some(dir.into());
         self
     }
 
@@ -322,13 +338,15 @@ impl TermHog {
 
 impl std::fmt::Debug for TermHog {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TermHog")
-            .field("ingest_host", &self.ingest_host)
+        let mut f = f.debug_struct("TermHog");
+        f.field("ingest_host", &self.ingest_host)
             .field("ui_host", &self.ui_host)
             .field("distinct_id", &self.distinct_id)
             .field("session_id", &self.session_id)
-            .field("fallback_size", &self.fallback_size)
-            .finish_non_exhaustive()
+            .field("fallback_size", &self.fallback_size);
+        #[cfg(windows)]
+        f.field("executable_dir", &self.executable_dir);
+        f.finish_non_exhaustive()
     }
 }
 
