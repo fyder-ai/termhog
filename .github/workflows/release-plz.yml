@@ -1,0 +1,92 @@
+name: Release-plz
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # Publishes to crates.io and creates the GitHub releases for any version
+  # that isn't published yet (merging the release PR bumps them).
+  release:
+    if: github.repository_owner == 'fyder-ai'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # crates.io trusted publishing
+      id-token: write
+    outputs:
+      cli_tag: ${{ steps.cli.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - id: release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - id: cli
+        env:
+          RELEASES: ${{ steps.release-plz.outputs.releases }}
+        run: |
+          tag=$(jq -r '.[] | select(.package_name == "termhog-cli") | .tag' <<< "${RELEASES:-[]}")
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  # Builds the CLI for each platform and attaches it to its GitHub release.
+  binaries:
+    needs: release
+    if: needs.release.outputs.cli_tag != ''
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-latest }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+          - { target: aarch64-pc-windows-msvc, os: windows-11-arm }
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.release.outputs.cli_tag }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: termhog
+          target: ${{ matrix.target }}
+          ref: refs/tags/${{ needs.release.outputs.cli_tag }}
+          archive: termhog-$target
+          checksum: sha256
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # Opens or updates the release PR, which bumps versions and changelogs.
+  release-pr:
+    if: github.repository_owner == 'fyder-ai'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

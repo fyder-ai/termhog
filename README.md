@@ -64,6 +64,9 @@ users, since TermHog runs what it finds there.
 cargo install termhog-cli
 ```
 
+Or download a prebuilt binary for Linux, macOS or Windows from
+[GitHub Releases](https://github.com/fyder-ai/termhog/releases).
+
 Put the command to record after `--`:
 
 ```bash
