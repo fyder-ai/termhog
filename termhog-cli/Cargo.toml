@@ -17,4 +17,4 @@ doc = false
 
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
-termhog = { version = "0.1.1", path = "../termhog" }
+termhog = { version = "0.1.2", path = "../termhog" }
