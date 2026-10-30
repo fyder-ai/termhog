@@ -36,11 +36,11 @@ use windows::start_child;
 /// finishes, in the background, once the child exits (if the app is still
 /// running then).
 pub struct Recording {
-    /// The child's stdin, if the command set it to [`HogStdio::piped`].
+    /// The child's stdin, if the command set it to [`crate::HogStdio::piped`].
     pub stdin: Option<ChildStdin>,
-    /// The child's stdout, if the command set it to [`HogStdio::piped`].
+    /// The child's stdout, if the command set it to [`crate::HogStdio::piped`].
     pub stdout: Option<ChildStdout>,
-    /// The child's stderr, if the command set it to [`HogStdio::piped`].
+    /// The child's stderr, if the command set it to [`crate::HogStdio::piped`].
     pub stderr: Option<ChildStderr>,
     pid: u32,
     replay_url: String,

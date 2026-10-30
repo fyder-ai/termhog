@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 #![warn(missing_docs)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 #[cfg(not(any(unix, windows)))]
 compile_error!("termhog doesn't support this platform yet");
@@ -195,7 +196,7 @@ pub struct TermHog {
     pub(crate) reporter: Option<Arc<dyn Reporter>>,
     pub(crate) fallback_size: (u16, u16),
     pub(crate) finish_timeout: Option<Duration>,
-    #[cfg(windows)]
+    #[cfg(any(windows, doc))]
     pub(crate) executable_dir: Option<std::path::PathBuf>,
 }
 
@@ -211,7 +212,7 @@ impl TermHog {
             reporter: None,
             fallback_size: (80, 24),
             finish_timeout: None,
-            #[cfg(windows)]
+            #[cfg(any(windows, doc))]
             executable_dir: None,
         }
     }
@@ -279,7 +280,8 @@ impl TermHog {
     ///
     /// The folder must not be writable by other users, since TermHog runs
     /// what it finds there.
-    #[cfg(windows)]
+    #[cfg(any(windows, doc))]
+    #[cfg_attr(docsrs, doc(cfg(windows)))]
     pub fn executable_dir(mut self, dir: impl Into<std::path::PathBuf>) -> TermHog {
         self.executable_dir = Some(dir.into());
         self
@@ -348,7 +350,7 @@ impl std::fmt::Debug for TermHog {
             .field("distinct_id", &self.distinct_id)
             .field("session_id", &self.session_id)
             .field("fallback_size", &self.fallback_size);
-        #[cfg(windows)]
+        #[cfg(any(windows, doc))]
         f.field("executable_dir", &self.executable_dir);
         f.finish_non_exhaustive()
     }

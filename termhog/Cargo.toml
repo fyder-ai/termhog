@@ -10,6 +10,11 @@ readme = "README.md"
 keywords = ["posthog", "session-replay", "terminal", "pty", "rrweb"]
 categories = ["development-tools", "command-line-interface"]
 
+[package.metadata.docs.rs]
+# docs.rs builds only the first target unless told otherwise, and the API
+# differs on Windows.
+targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-apple-darwin"]
+
 [dependencies]
 # avt with the erased-cell fix, published as a fork until asciinema releases
 # it (https://github.com/asciinema/avt/pull/29). Imported as `avt`.
