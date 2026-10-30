@@ -6,9 +6,10 @@
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
-use std::os::unix::fs::FileExt;
 
 use serde_json::Value;
+
+use crate::util::FileExt;
 
 /// Events read back for one upload.
 pub struct Batch {

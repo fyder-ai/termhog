@@ -17,6 +17,9 @@ use rustix::process;
 use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
 use rustix::termios::{OptionalActions, Termios, Winsize, tcsetattr, tcsetwinsize};
 
+/// The child, as std starts it here.
+pub use std::process::Child;
+
 /// An open pty pair. The master stays with us, the slave goes to the child.
 pub struct Pty {
     pub master: File,

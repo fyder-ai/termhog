@@ -19,11 +19,14 @@ mod store;
 
 use std::collections::HashSet;
 use std::io::BufReader;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::process::Stdio;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(unix)]
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -114,27 +117,36 @@ fn launch_uploader() {
     let Some(exe) = own_executable() else {
         return;
     };
-    let mut command = std::process::Command::new(exe);
-    command
-        // What `ps` shows, so the process explains itself.
-        .arg0("termhog-uploader")
-        .env(UPLOADER_VAR, "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    if let Some(dir) = store::dir() {
-        // Not the app's directory, which it may want to unmount or delete.
-        command.current_dir(dir);
+    // Not the app's directory, which it may want to unmount or delete.
+    let dir = store::dir();
+    #[cfg(unix)]
+    {
+        let mut command = std::process::Command::new(exe);
+        command
+            // What `ps` shows, so the process explains itself.
+            .arg0("termhog-uploader")
+            .env(UPLOADER_VAR, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Some(dir) = dir {
+            command.current_dir(dir);
+        }
+        // SAFETY: setsid is async-signal-safe and allocates nothing. A session
+        // of its own leaves the terminal behind, so closing it doesn't end
+        // uploads.
+        unsafe {
+            command.pre_exec(|| rustix::process::setsid().map(drop).map_err(Into::into));
+        }
+        if let Ok(mut child) = command.spawn() {
+            // Reap it if it finishes while this process still runs.
+            thread::spawn(move || child.wait());
+        }
     }
-    // SAFETY: setsid is async-signal-safe and allocates nothing. A session of
-    // its own leaves the terminal behind, so closing it doesn't end uploads.
-    unsafe {
-        command.pre_exec(|| rustix::process::setsid().map(drop).map_err(Into::into));
-    }
-    if let Ok(mut child) = command.spawn() {
-        // Reap it if it finishes while this process still runs.
-        thread::spawn(move || child.wait());
-    }
+    // Not through std, which hands a child every inheritable handle we have
+    // on Windows, like a pipe our output goes to, keeping it open.
+    #[cfg(windows)]
+    let _ = crate::util::spawn_detached(&exe, (UPLOADER_VAR, "1"), dir.as_deref());
 }
 
 /// The running executable. If its file was deleted since it started (say, by
@@ -151,6 +163,9 @@ fn own_executable() -> Option<PathBuf> {
 /// The uploader: finish every checkpoint waiting, until none are left or its
 /// lifetime runs out.
 fn run_uploader() {
+    // On Windows the uploader is started inheriting nothing (see
+    // `launch_uploader`).
+    #[cfg(unix)]
     close_inherited_files();
     let give_up_at = Instant::now() + UPLOADER_LIFETIME;
     // New checkpoints may arrive meanwhile, so look again after each round,
@@ -205,6 +220,7 @@ fn finish(mut claimed: store::Claimed, give_up_at: Instant) {
 /// (which are the null device). One left open by whatever started the app,
 /// like a pipe collecting its output, would otherwise stay open as long as
 /// the uploader runs, making the app look like it never finished.
+#[cfg(unix)]
 fn close_inherited_files() {
     let dir = if cfg!(target_os = "linux") {
         "/proc/self/fd"

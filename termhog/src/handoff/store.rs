@@ -9,11 +9,11 @@
 
 use std::fs::{self, DirBuilder, File};
 use std::io::{self, BufWriter};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+#[cfg(unix)]
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use rustix::fs::{FlockOperation, flock};
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 
@@ -41,11 +41,12 @@ fn path() -> Option<PathBuf> {
 /// The checkpoint folder, created if needed.
 pub fn dir() -> Option<PathBuf> {
     let dir = path()?;
-    DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&dir)
-        .ok()?;
+    let mut builder = DirBuilder::new();
+    builder.recursive(true);
+    // On Windows the user's cache folder is already private to them.
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder.create(&dir).ok()?;
     Some(dir)
 }
 
@@ -110,11 +111,23 @@ fn write_new(path: &Path, write: impl FnOnce(&mut Writer) -> io::Result<()>) -> 
     // Deleted unless it's moved into place. One left by a writer that died
     // is deleted by `tidy`.
     let temp = tempfile::Builder::new().suffix(".tmp").tempfile_in(dir)?;
-    flock(temp.as_file(), FlockOperation::NonBlockingLockExclusive)?;
+    try_lock(temp.as_file())?;
     let mut out = BufWriter::new(temp);
     write(&mut out)?;
     let temp = out.into_inner().map_err(|e| e.into_error())?;
-    temp.persist(path).map_err(|e| e.error)
+    #[cfg(unix)]
+    return temp.persist(path).map_err(|e| e.error);
+    // The checkpoint being replaced is open and locked by whoever claimed
+    // it, which `persist` can't rename over on Windows.
+    #[cfg(windows)]
+    {
+        let (file, temp_path) = temp.keep().map_err(|e| e.error)?;
+        if let Err(e) = crate::util::replace_file(&temp_path, path) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(e);
+        }
+        Ok(file)
+    }
 }
 
 /// Open `path` and take its lock, unless someone else holds it. The file may
@@ -122,9 +135,49 @@ fn write_new(path: &Path, write: impl FnOnce(&mut Writer) -> io::Result<()>) -> 
 /// lock of a file no longer at `path` guards nothing, so that's `None` too.
 fn try_claim(path: &Path) -> Option<File> {
     let file = File::open(path).ok()?;
-    flock(&file, FlockOperation::NonBlockingLockExclusive).ok()?;
-    let (held, current) = (file.metadata().ok()?, fs::metadata(path).ok()?);
-    (held.dev() == current.dev() && held.ino() == current.ino()).then_some(file)
+    try_lock(&file).ok()?;
+    is_at(&file, path).then_some(file)
+}
+
+/// Take an exclusive lock on `file`, failing at once if someone holds it.
+#[cfg(unix)]
+fn try_lock(file: &File) -> io::Result<()> {
+    use rustix::fs::{FlockOperation, flock};
+    Ok(flock(file, FlockOperation::NonBlockingLockExclusive)?)
+}
+
+/// Take an exclusive lock on `file`, failing at once if someone holds it.
+/// Windows locks are mandatory, but only other handles are kept out, so the
+/// holder can still read and replace the file.
+#[cfg(windows)]
+fn try_lock(file: &File) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+    };
+    let flags = LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY;
+    // SAFETY: a zeroed OVERLAPPED locks from offset 0, and the call is
+    // synchronous, so it doesn't outlive the call.
+    let mut overlapped = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        LockFileEx(
+            file.as_raw_handle(),
+            flags,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Whether the open `file` is the one now at `path`.
+fn is_at(file: &File, path: &Path) -> bool {
+    File::open(path).is_ok_and(|current| crate::util::same_file(file, &current))
 }
 
 /// The files in `dir` with extension `ext`, oldest first, with their
@@ -175,4 +228,34 @@ fn tidy(dir: &Path) {
 fn older_than(meta: &fs::Metadata, age: Duration) -> bool {
     let changed = meta.modified().ok().and_then(|t| t.elapsed().ok());
     changed.is_some_and(|changed| changed > age)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Seek, Write};
+
+    use super::*;
+
+    /// What the uploader does with a checkpoint it rendered: replace its
+    /// contents while holding it, and keep holding it.
+    #[test]
+    fn a_claimed_checkpoint_can_be_replaced_and_stays_claimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("one.{EXTENSION}"));
+        write_new(&path, |out| out.write_all(b"before")).unwrap();
+        let mut claimed = Claimed {
+            file: try_claim(&path).unwrap(),
+            path: path.clone(),
+        };
+
+        replace(&mut claimed, |out| out.write_all(b"after")).unwrap();
+
+        // Read through the claim: Windows locks keep other handles out.
+        let mut contents = String::new();
+        claimed.file.rewind().unwrap();
+        claimed.file.read_to_string(&mut contents).unwrap();
+        assert_eq!(contents, "after");
+        assert!(is_at(&claimed.file, &path));
+        assert!(try_claim(&path).is_none(), "someone else claimed it");
+    }
 }

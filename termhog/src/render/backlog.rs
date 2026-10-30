@@ -8,9 +8,10 @@
 
 use std::fs::File;
 use std::io;
-use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+
+use crate::util::FileExt;
 
 /// In-memory output the render thread may fall behind by before spilling to
 /// disk.
