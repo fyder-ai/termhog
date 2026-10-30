@@ -54,8 +54,6 @@ type CloseFn = unsafe extern "system" fn(HPCON);
 const CONPTY_VERSION: &str = env!("TERMHOG_CONPTY_VERSION");
 const CONPTY_DLL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/conpty.dll"));
 const OPENCONSOLE_EXE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/OpenConsole.exe"));
-/// Microsoft's license for the files, which goes wherever they do.
-const CONPTY_LICENSE: &str = include_str!("../../ConPTY-LICENSE.txt");
 
 /// The ConPTY functions, from the embedded `conpty.dll`, and the folder it
 /// was installed in.
@@ -103,7 +101,6 @@ fn install(dir: &Path) -> io::Result<()> {
     let files = [
         ("conpty.dll", CONPTY_DLL),
         ("OpenConsole.exe", OPENCONSOLE_EXE),
-        ("LICENSE.txt", CONPTY_LICENSE.as_bytes()),
     ];
     for (name, bytes) in files {
         let path = dir.join(name);
